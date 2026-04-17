@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
@@ -422,6 +423,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
+	case "kiro":
+		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
 	case "iflow":
 		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "kimi":
@@ -899,6 +902,17 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = applyExcludedModels(models, excluded)
+	case "kiro":
+		resolvedModels, updatedAuth, errKiro := helps.FetchKiroAvailableModels(context.Background(), s.cfg, a.Clone())
+		if errKiro != nil {
+			log.WithError(errKiro).Warnf("failed to refresh kiro model catalog for auth %s", a.ID)
+			return
+		}
+		if updatedAuth != nil {
+			a = updatedAuth
+		}
+		models = resolvedModels
 		models = applyExcludedModels(models, excluded)
 	case "codex":
 		codexPlanType := ""

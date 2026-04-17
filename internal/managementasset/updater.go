@@ -189,6 +189,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		log.Debug("management asset sync skipped: empty static directory")
 		return false
 	}
+	allowOfficialFallback := shouldUseOfficialPanelFallback(panelRepository)
 	localPath := filepath.Join(staticDir, managementAssetName)
 
 	_, _, _ = sfGroup.Do(localPath, func() (interface{}, error) {
@@ -235,10 +236,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
 		if err != nil {
 			if localFileMissing {
-				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
-				if ensureFallbackManagementHTML(ctx, client, localPath) {
+				if allowOfficialFallback {
+					log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
+					if ensureFallbackManagementHTML(ctx, client, localPath) {
+						return nil, nil
+					}
 					return nil, nil
 				}
+				log.WithError(err).Warn("failed to fetch latest management release information from custom panel repository")
 				return nil, nil
 			}
 			log.WithError(err).Warn("failed to fetch latest management release information")
@@ -253,10 +258,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
 		if err != nil {
 			if localFileMissing {
-				log.WithError(err).Warn("failed to download management asset, trying fallback page")
-				if ensureFallbackManagementHTML(ctx, client, localPath) {
+				if allowOfficialFallback {
+					log.WithError(err).Warn("failed to download management asset, trying fallback page")
+					if ensureFallbackManagementHTML(ctx, client, localPath) {
+						return nil, nil
+					}
 					return nil, nil
 				}
+				log.WithError(err).Warn("failed to download management asset from custom panel repository")
 				return nil, nil
 			}
 			log.WithError(err).Warn("failed to download management asset")
@@ -279,6 +288,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 	_, err := os.Stat(localPath)
 	return err == nil
+}
+
+func shouldUseOfficialPanelFallback(panelRepository string) bool {
+	panelRepository = strings.TrimSpace(panelRepository)
+	if panelRepository == "" {
+		return true
+	}
+	return strings.EqualFold(resolveReleaseURL(panelRepository), defaultManagementReleaseURL)
 }
 
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {

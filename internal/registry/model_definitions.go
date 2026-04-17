@@ -22,6 +22,16 @@ type staticModelsJSON struct {
 	Antigravity []*ModelInfo `json:"antigravity"`
 }
 
+var kiroSupportedClaudeModels = map[string]struct{}{
+	"claude-haiku-4-5-20251001":  {},
+	"claude-sonnet-4-20250514":   {},
+	"claude-sonnet-4-5-20250929": {},
+	"claude-sonnet-4-6":          {},
+	"claude-opus-4-20250514":     {},
+	"claude-opus-4-5-20251101":   {},
+	"claude-opus-4-6":            {},
+}
+
 // GetClaudeModels returns the standard Claude model definitions.
 func GetClaudeModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Claude)
@@ -82,6 +92,27 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// GetKiroModels returns the Claude-family model definitions exposed through Kiro.
+func GetKiroModels() []*ModelInfo {
+	source := getModels().Claude
+	if len(source) == 0 {
+		return nil
+	}
+	out := make([]*ModelInfo, 0, len(source))
+	for _, model := range source {
+		if model == nil {
+			continue
+		}
+		if _, ok := kiroSupportedClaudeModels[model.ID]; !ok {
+			continue
+		}
+		cloned := cloneModelInfo(model)
+		cloned.OwnedBy = "kiro"
+		out = append(out, cloned)
+	}
+	return out
+}
+
 // cloneModelInfos returns a shallow copy of the slice with each element deep-cloned.
 func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 	if len(models) == 0 {
@@ -107,6 +138,7 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - iflow
 //   - kimi
 //   - antigravity
+//   - kiro
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
@@ -128,6 +160,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
+	case "kiro":
+		return GetKiroModels()
 	default:
 		return nil
 	}
@@ -151,6 +185,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.IFlow,
 		data.Kimi,
 		data.Antigravity,
+		GetKiroModels(),
 	}
 	for _, models := range allModels {
 		for _, m := range models {

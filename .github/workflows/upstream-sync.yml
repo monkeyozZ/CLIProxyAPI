@@ -1,0 +1,187 @@
+name: upstream-sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/router-for-me/CLIProxyAPI.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: automation/upstream-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Prepare git remotes
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "${UPSTREAM_REPO}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_REPO}"
+          git fetch origin "${DEFAULT_BRANCH}"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Merge upstream
+        id: merge
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git checkout -B "${SYNC_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+          if ! git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            git merge --abort || true
+            {
+              echo "## Upstream sync blocked"
+              echo
+              echo "Automatic merge from \`upstream/${UPSTREAM_BRANCH}\` into \`${DEFAULT_BRANCH}\` has conflicts."
+              echo "Manual conflict resolution is required."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+          if git diff --quiet "origin/${DEFAULT_BRANCH}...HEAD"; then
+            echo "has_changes=false" >> "${GITHUB_OUTPUT}"
+            {
+              echo "## Upstream sync"
+              echo
+              echo "No upstream changes were detected."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          echo "has_changes=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Check protected Kiro paths
+        if: steps.merge.outputs.has_changes == 'true'
+        id: guard
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" | sort -u > changed_files.txt
+
+          {
+            echo "changed_files<<EOF"
+            cat changed_files.txt
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          : > guarded_files.txt
+          while IFS= read -r pattern; do
+            [ -z "${pattern}" ] && continue
+            git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" -- "${pattern}" >> guarded_files.txt || true
+          done <<'EOF'
+          :(glob)internal/api/handlers/management/kiro*.go
+          :(glob)internal/runtime/executor/kiro*.go
+          :(glob)internal/runtime/executor/helps/kiro*.go
+          internal/api/server.go
+          internal/api/handlers/management/auth_files.go
+          internal/api/handlers/management/api_tools.go
+          internal/api/handlers/management/oauth_sessions.go
+          internal/api/handlers/management/oauth_callback.go
+          internal/config/config.go
+          internal/managementasset/updater.go
+          internal/registry/model_definitions.go
+          sdk/api/management.go
+          sdk/cliproxy/service.go
+          internal/tui/oauth_tab.go
+          config.example.yaml
+          EOF
+
+          sort -u guarded_files.txt -o guarded_files.txt
+          if [ -s guarded_files.txt ]; then
+            echo "protected_hit=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo "guarded_files<<EOF"
+              cat guarded_files.txt
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            echo "protected_hit=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Push sync branch
+        if: steps.merge.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "${SYNC_BRANCH}"
+
+      - name: Create or update sync PR
+        if: steps.merge.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PROTECTED_HIT: ${{ steps.guard.outputs.protected_hit }}
+          GUARDED_FILES: ${{ steps.guard.outputs.guarded_files }}
+          CHANGED_FILES: ${{ steps.guard.outputs.changed_files }}
+        run: |
+          set -euo pipefail
+
+          if [ "${PROTECTED_HIT}" = "true" ]; then
+            PR_TITLE="chore: sync upstream changes [manual Kiro review required]"
+          else
+            PR_TITLE="chore: sync upstream changes"
+          fi
+
+          cat > pr-body.md <<EOF
+          Automated sync from \`${UPSTREAM_REPO}\`.
+
+          - Base branch: \`${DEFAULT_BRANCH}\`
+          - Upstream branch: \`${UPSTREAM_BRANCH}\`
+          - Protected Kiro paths changed: **${PROTECTED_HIT}**
+
+          Changed files:
+          \`\`\`
+          ${CHANGED_FILES}
+          \`\`\`
+          EOF
+
+          if [ "${PROTECTED_HIT}" = "true" ]; then
+            cat >> pr-body.md <<EOF
+
+          Guarded files that require manual review:
+          \`\`\`
+          ${GUARDED_FILES}
+          \`\`\`
+
+          This PR must not be merged blindly because it touches Kiro-related paths.
+          EOF
+          fi
+
+          pr_number="$(gh pr list --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${pr_number}" ]; then
+            gh pr edit "${pr_number}" --title "${PR_TITLE}" --body-file pr-body.md
+          else
+            gh pr create --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file pr-body.md
+          fi
+
+      - name: Block automatic progression on protected paths
+        if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.protected_hit == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Kiro path guard triggered"
+            echo
+            echo "The sync PR was created or updated, but protected Kiro-related files changed."
+            echo "Manual review is required before any merge."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 1

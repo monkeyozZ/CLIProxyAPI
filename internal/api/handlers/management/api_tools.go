@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -261,6 +262,21 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 	if provider == "antigravity" {
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
 		return token, errToken
+	}
+	if isKiroAuth(auth) {
+		token, updatedAuth, errToken := helps.EnsureKiroAccessToken(ctx, h.cfg, auth)
+		if errToken != nil {
+			return "", errToken
+		}
+		if updatedAuth != nil && h != nil && h.authManager != nil {
+			updatedAuth.FileName = auth.FileName
+			updatedAuth.ID = auth.ID
+			updatedAuth.Index = auth.Index
+			if _, errUpdate := h.authManager.Update(ctx, updatedAuth); errUpdate != nil {
+				log.WithError(errUpdate).Warn("failed to persist refreshed kiro auth from management api-call")
+			}
+		}
+		return token, nil
 	}
 
 	return tokenValueForAuth(auth), nil

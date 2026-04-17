@@ -31,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -349,6 +350,39 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						fileData["note"] = trimmed
 					}
 				}
+				if strings.EqualFold(strings.TrimSpace(typeValue), "kiro") {
+					if authMethod := strings.TrimSpace(gjson.GetBytes(data, "auth_method").String()); authMethod != "" {
+						fileData["auth_method"] = authMethod
+					}
+					if region := strings.TrimSpace(gjson.GetBytes(data, "region").String()); region != "" {
+						fileData["region"] = region
+					}
+					if apiRegion := strings.TrimSpace(gjson.GetBytes(data, "api_region").String()); apiRegion != "" {
+						fileData["api_region"] = apiRegion
+					}
+					if machineID := strings.TrimSpace(gjson.GetBytes(data, "machine_id").String()); machineID != "" {
+						fileData["machine_id"] = machineID
+					}
+					if profileARN := strings.TrimSpace(gjson.GetBytes(data, "profile_arn").String()); profileARN != "" {
+						fileData["profile_arn"] = profileARN
+					}
+					if subscriptionTitle := strings.TrimSpace(gjson.GetBytes(data, "subscription_title").String()); subscriptionTitle != "" {
+						fileData["subscription_title"] = subscriptionTitle
+					}
+					if clientID := strings.TrimSpace(gjson.GetBytes(data, "client_id").String()); clientID != "" {
+						fileData["client_id"] = clientID
+					}
+					if proxyURL := strings.TrimSpace(gjson.GetBytes(data, "proxy_url").String()); proxyURL != "" {
+						fileData["proxy_url"] = proxyURL
+					}
+					if proxyUsername := strings.TrimSpace(gjson.GetBytes(data, "proxy_username").String()); proxyUsername != "" {
+						fileData["proxy_username"] = proxyUsername
+					}
+					fileData["has_access_token"] = strings.TrimSpace(gjson.GetBytes(data, "access_token").String()) != ""
+					fileData["has_refresh_token"] = strings.TrimSpace(gjson.GetBytes(data, "refresh_token").String()) != ""
+					fileData["has_client_secret"] = strings.TrimSpace(gjson.GetBytes(data, "client_secret").String()) != ""
+					fileData["has_proxy_password"] = strings.TrimSpace(gjson.GetBytes(data, "proxy_password").String()) != ""
+				}
 			}
 
 			files = append(files, fileData)
@@ -463,7 +497,46 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	appendKiroAuthEntryFields(entry, auth)
 	return entry
+}
+
+func appendKiroAuthEntryFields(entry gin.H, auth *coreauth.Auth) {
+	if entry == nil || !isKiroAuth(auth) {
+		return
+	}
+	creds := helps.KiroCredentialsFromAuth(auth)
+	if authMethod := strings.TrimSpace(creds.AuthMethod); authMethod != "" {
+		entry["auth_method"] = authMethod
+	}
+	if region := strings.TrimSpace(creds.Region); region != "" {
+		entry["region"] = region
+	}
+	if apiRegion := strings.TrimSpace(creds.APIRegion); apiRegion != "" {
+		entry["api_region"] = apiRegion
+	}
+	if machineID := strings.TrimSpace(creds.MachineID); machineID != "" {
+		entry["machine_id"] = machineID
+	}
+	if profileARN := strings.TrimSpace(creds.ProfileARN); profileARN != "" {
+		entry["profile_arn"] = profileARN
+	}
+	if subscriptionTitle := strings.TrimSpace(creds.SubscriptionTitle); subscriptionTitle != "" {
+		entry["subscription_title"] = subscriptionTitle
+	}
+	if clientID := strings.TrimSpace(creds.ClientID); clientID != "" {
+		entry["client_id"] = clientID
+	}
+	if proxyURL := strings.TrimSpace(creds.ProxyURL); proxyURL != "" {
+		entry["proxy_url"] = proxyURL
+	}
+	if proxyUsername := strings.TrimSpace(creds.ProxyUsername); proxyUsername != "" {
+		entry["proxy_username"] = proxyUsername
+	}
+	entry["has_access_token"] = strings.TrimSpace(creds.AccessToken) != ""
+	entry["has_refresh_token"] = strings.TrimSpace(creds.RefreshToken) != ""
+	entry["has_client_secret"] = strings.TrimSpace(creds.ClientSecret) != ""
+	entry["has_proxy_password"] = strings.TrimSpace(creds.ProxyPassword) != ""
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

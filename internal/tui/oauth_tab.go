@@ -24,6 +24,7 @@ var oauthProviders = []oauthProvider{
 	{"Codex (OpenAI)", "codex-auth-url", "🟩"},
 	{"Antigravity", "antigravity-auth-url", "🟪"},
 	{"Kimi", "kimi-auth-url", "🟫"},
+	{"Kiro", "kiro-auth-url", "🟨"},
 	{"IFlow", "iflow-auth-url", "⬜"},
 }
 
@@ -281,6 +282,8 @@ func (m oauthTabModel) submitCallback(callbackURL string) tea.Cmd {
 					providerKey = "antigravity"
 				case "kimi-auth-url":
 					providerKey = "kimi"
+				case "kiro-auth-url":
+					providerKey = "kiro"
 				case "iflow-auth-url":
 					providerKey = "iflow"
 				}
