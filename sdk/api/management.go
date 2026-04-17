@@ -19,8 +19,6 @@ type ManagementTokenRequester interface {
 	RequestAntigravityToken(*gin.Context)
 	RequestKimiToken(*gin.Context)
 	RequestKiroToken(*gin.Context)
-	RequestIFlowToken(*gin.Context)
-	RequestIFlowCookieToken(*gin.Context)
 	GetAuthStatus(c *gin.Context)
 	PostOAuthCallback(c *gin.Context)
 }
@@ -59,15 +57,6 @@ func (m *managementTokenRequester) RequestKimiToken(c *gin.Context) {
 func (m *managementTokenRequester) RequestKiroToken(c *gin.Context) {
 	m.handler.RequestKiroToken(c)
 }
-
-func (m *managementTokenRequester) RequestIFlowToken(c *gin.Context) {
-	m.handler.RequestIFlowToken(c)
-}
-
-func (m *managementTokenRequester) RequestIFlowCookieToken(c *gin.Context) {
-	m.handler.RequestIFlowCookieToken(c)
-}
-
 func (m *managementTokenRequester) GetAuthStatus(c *gin.Context) {
 	m.handler.GetAuthStatus(c)
 }
