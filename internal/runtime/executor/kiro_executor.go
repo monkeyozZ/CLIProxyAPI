@@ -153,10 +153,21 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	out := make(chan cliproxyexecutor.StreamChunk, 16)
 	go func() {
 		defer close(out)
+		sendStreamErr := func(err error) {
+			if err == nil {
+				return
+			}
+			log.Errorf("kiro executor: stream emission failed: %v", err)
+			out <- cliproxyexecutor.StreamChunk{Err: err}
+		}
 		if from == to {
 			chunks, errBuild := buildClaudeSSEChunks(baseModel, events)
 			if errBuild != nil {
-				log.Errorf("kiro executor: build claude sse chunks failed: %v", errBuild)
+				sendStreamErr(statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("kiro build claude sse chunks failed: %v", errBuild)})
+				return
+			}
+			if len(chunks) == 0 {
+				sendStreamErr(statusErr{code: http.StatusBadGateway, msg: "kiro stream produced no claude chunks"})
 				return
 			}
 			for _, chunk := range chunks {
@@ -167,15 +178,23 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 		dataLines, errBuild := buildClaudeDataLines(baseModel, events)
 		if errBuild != nil {
-			log.Errorf("kiro executor: build claude data lines failed: %v", errBuild)
+			sendStreamErr(statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("kiro build claude data lines failed: %v", errBuild)})
 			return
 		}
 		var param any
+		sentAny := false
 		for _, line := range dataLines {
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, line, &param)
 			for i := range chunks {
+				if len(chunks[i]) == 0 {
+					continue
+				}
+				sentAny = true
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
+		}
+		if !sentAny {
+			sendStreamErr(statusErr{code: http.StatusBadGateway, msg: "kiro stream produced no translated chunks"})
 		}
 	}()
 

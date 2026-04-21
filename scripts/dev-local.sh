@@ -21,9 +21,10 @@ Environment overrides:
   CLIPROXY_LOCAL_MODEL  Set to 0 to disable --local-model (default: 1)
   CLIPROXY_WATCH_INTERVAL
                         Poll interval in seconds for --watch (default: 1)
-  GOPATH                Go workspace (default: /tmp/go)
-  GOMODCACHE            Go module cache (default: /tmp/go/pkg/mod)
-  GOCACHE               Go build cache (default: /tmp/go-build)
+  GOPATH                Go workspace (default: $HOME/.cache/cliproxy-go, fallback: /tmp/go)
+  GOMODCACHE            Go module cache (default: $GOPATH/pkg/mod)
+  GOCACHE               Go build cache (default: macOS $HOME/Library/Caches/cliproxy-go-build,
+                        otherwise $XDG_CACHE_HOME/cliproxy-go-build or $HOME/.cache/cliproxy-go-build)
 EOF
 }
 
@@ -44,9 +45,24 @@ CLIPROXY_CONFIG="${CLIPROXY_CONFIG:-./config.yaml}"
 CLIPROXY_LOCAL_MODEL="${CLIPROXY_LOCAL_MODEL:-1}"
 CLIPROXY_WATCH_INTERVAL="${CLIPROXY_WATCH_INTERVAL:-1}"
 
-export GOPATH="${GOPATH:-/tmp/go}"
-export GOMODCACHE="${GOMODCACHE:-/tmp/go/pkg/mod}"
-export GOCACHE="${GOCACHE:-/tmp/go-build}"
+OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
+USER_HOME="${HOME:-}"
+
+DEFAULT_GOPATH="/tmp/go"
+DEFAULT_GOCACHE="/tmp/go-build"
+if [[ -n "${USER_HOME}" ]]; then
+  DEFAULT_GOPATH="${USER_HOME}/.cache/cliproxy-go"
+  if [[ "${OS_NAME}" == "Darwin" ]]; then
+    DEFAULT_GOCACHE="${USER_HOME}/Library/Caches/cliproxy-go-build"
+  else
+    DEFAULT_GOCACHE="${XDG_CACHE_HOME:-${USER_HOME}/.cache}/cliproxy-go-build"
+  fi
+fi
+DEFAULT_GOMODCACHE="${DEFAULT_GOPATH}/pkg/mod"
+
+export GOPATH="${GOPATH:-${DEFAULT_GOPATH}}"
+export GOMODCACHE="${GOMODCACHE:-${DEFAULT_GOMODCACHE}}"
+export GOCACHE="${GOCACHE:-${DEFAULT_GOCACHE}}"
 
 BUILD_ONLY=0
 WATCH_MODE=0
