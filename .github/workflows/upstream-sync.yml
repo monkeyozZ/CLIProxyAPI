@@ -119,6 +119,34 @@ jobs:
             echo "protected_hit=false" >> "${GITHUB_OUTPUT}"
           fi
 
+          : > validation_files.txt
+          while IFS= read -r pattern; do
+            [ -z "${pattern}" ] && continue
+            git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" -- "${pattern}" >> validation_files.txt || true
+          done <<'EOF'
+          :(glob)internal/api/handlers/management/kiro*.go
+          :(glob)internal/runtime/executor/kiro*.go
+          :(glob)internal/runtime/executor/helps/kiro*.go
+          sdk/translator/registry.go
+          internal/interfaces/types.go
+          internal/constant/constant.go
+          :(glob)internal/translator/openai/claude/**
+          :(glob)internal/translator/claude/openai/chat-completions/**
+          :(glob)internal/translator/claude/openai/responses/**
+          EOF
+
+          sort -u validation_files.txt -o validation_files.txt
+          if [ -s validation_files.txt ]; then
+            echo "validation_hit=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo "validation_files<<EOF"
+              cat validation_files.txt
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            echo "validation_hit=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Push sync branch
         if: steps.merge.outputs.has_changes == 'true'
         run: |
@@ -132,7 +160,9 @@ jobs:
           TARGET_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PROTECTED_HIT: ${{ steps.guard.outputs.protected_hit }}
+          VALIDATION_HIT: ${{ steps.guard.outputs.validation_hit }}
           GUARDED_FILES: ${{ steps.guard.outputs.guarded_files }}
+          VALIDATION_FILES: ${{ steps.guard.outputs.validation_files }}
           CHANGED_FILES: ${{ steps.guard.outputs.changed_files }}
         run: |
           set -euo pipefail
@@ -149,6 +179,7 @@ jobs:
           - Base branch: \`${DEFAULT_BRANCH}\`
           - Upstream branch: \`${UPSTREAM_BRANCH}\`
           - Protected Kiro paths changed: **${PROTECTED_HIT}**
+          - Kiro targeted validation required: **${VALIDATION_HIT}**
 
           Changed files:
           \`\`\`
@@ -168,12 +199,52 @@ jobs:
           EOF
           fi
 
+          if [ "${VALIDATION_HIT}" = "true" ]; then
+            cat >> pr-body.md <<EOF
+
+          Kiro targeted validation paths:
+          \`\`\`
+          ${VALIDATION_FILES}
+          \`\`\`
+          EOF
+          fi
+
           pr_number="$(gh pr list --repo "${TARGET_REPO}" --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
           if [ -n "${pr_number}" ]; then
             gh pr edit "${pr_number}" --repo "${TARGET_REPO}" --title "${PR_TITLE}" --body-file pr-body.md
           else
             gh pr create --repo "${TARGET_REPO}" --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file pr-body.md
           fi
+
+      - name: Set up Go for Kiro targeted validation
+        if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.validation_hit == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Kiro targeted validation
+        if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.validation_hit == 'true'
+        id: kiro_validate
+        run: bash scripts/run_kiro_targeted_tests.sh
+
+      - name: Summarize Kiro targeted validation
+        if: always() && steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.validation_hit == 'true'
+        env:
+          VALIDATION_FILES: ${{ steps.guard.outputs.validation_files }}
+          VALIDATION_OUTCOME: ${{ steps.kiro_validate.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Kiro targeted validation"
+            echo
+            echo "Outcome: \`${VALIDATION_OUTCOME}\`"
+            echo
+            echo "Triggered by these files:"
+            echo "\`\`\`"
+            echo "${VALIDATION_FILES}"
+            echo "\`\`\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Block automatic progression on protected paths
         if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.protected_hit == 'true'
