@@ -129,6 +129,7 @@ jobs:
         if: steps.merge.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PROTECTED_HIT: ${{ steps.guard.outputs.protected_hit }}
           GUARDED_FILES: ${{ steps.guard.outputs.guarded_files }}
@@ -167,11 +168,11 @@ jobs:
           EOF
           fi
 
-          pr_number="$(gh pr list --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          pr_number="$(gh pr list --repo "${TARGET_REPO}" --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
           if [ -n "${pr_number}" ]; then
-            gh pr edit "${pr_number}" --title "${PR_TITLE}" --body-file pr-body.md
+            gh pr edit "${pr_number}" --repo "${TARGET_REPO}" --title "${PR_TITLE}" --body-file pr-body.md
           else
-            gh pr create --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file pr-body.md
+            gh pr create --repo "${TARGET_REPO}" --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file pr-body.md
           fi
 
       - name: Block automatic progression on protected paths
