@@ -41,10 +41,6 @@ func (h *Handler) GetKiroAuthBalance(c *gin.Context) {
 		return
 	}
 	balance, updatedAuth, err := helps.FetchKiroBalance(c.Request.Context(), h.cfg, auth.Clone())
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
-	}
 	if updatedAuth != nil {
 		updatedAuth.FileName = auth.FileName
 		updatedAuth.ID = auth.ID
@@ -53,6 +49,10 @@ func (h *Handler) GetKiroAuthBalance(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update kiro auth: %v", errUpdate)})
 			return
 		}
+	}
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
 	}
 	resolvedName := strings.TrimSpace(auth.FileName)
 	if resolvedName == "" {

@@ -341,15 +341,37 @@ func RefreshKiroAuth(ctx context.Context, cfg *config.Config, auth *cliproxyauth
 }
 
 func FetchKiroBalance(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (KiroBalance, *cliproxyauth.Auth, error) {
+	targetAuth, token, creds, err := prepareKiroBalanceAuth(ctx, cfg, auth)
+	if err != nil {
+		return KiroBalance{}, targetAuth, err
+	}
+	return fetchKiroBalanceWithToken(ctx, cfg, targetAuth, creds, token)
+}
+
+func prepareKiroBalanceAuth(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, string, KiroCredentials, error) {
+	if auth == nil {
+		return nil, "", KiroCredentials{}, KiroHTTPStatusError{code: http.StatusUnauthorized, msg: "missing kiro auth"}
+	}
 	token, updatedAuth, err := EnsureKiroAccessToken(ctx, cfg, auth)
 	if err != nil {
-		return KiroBalance{}, nil, err
+		return nil, "", KiroCredentials{}, err
 	}
 	targetAuth := auth
 	if updatedAuth != nil {
 		targetAuth = updatedAuth
 	}
 	creds := KiroCredentialsFromAuth(targetAuth)
+
+	// Force one upstream profile probe before reading balance so suspended
+	// accounts are surfaced even when getUsageLimits still returns 200.
+	if _, errProbe := listKiroAvailableProfiles(ctx, cfg, targetAuth, creds, token); errProbe != nil {
+		return targetAuth, "", creds, errProbe
+	}
+
+	return targetAuth, token, creds, nil
+}
+
+func fetchKiroBalanceWithToken(ctx context.Context, cfg *config.Config, targetAuth *cliproxyauth.Auth, creds KiroCredentials, token string) (KiroBalance, *cliproxyauth.Auth, error) {
 	host := fmt.Sprintf("q.%s.amazonaws.com", creds.effectiveAPIRegion())
 	requestURL := fmt.Sprintf("https://%s/getUsageLimits?origin=%s&resourceType=%s", host, kiroOriginAIEditor, kiroResourceTypeAgentic)
 	if strings.TrimSpace(creds.ProfileARN) != "" {
@@ -357,12 +379,12 @@ func FetchKiroBalance(ctx context.Context, cfg *config.Config, auth *cliproxyaut
 	}
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if errReq != nil {
-		return KiroBalance{}, nil, errReq
+		return KiroBalance{}, targetAuth, errReq
 	}
 	applyKiroUsageHeaders(req, creds, host, token)
 	resp, errDo := NewKiroHTTPClient(ctx, cfg, targetAuth, creds, 60*time.Second).Do(req)
 	if errDo != nil {
-		return KiroBalance{}, nil, errDo
+		return KiroBalance{}, targetAuth, errDo
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -371,14 +393,14 @@ func FetchKiroBalance(ctx context.Context, cfg *config.Config, auth *cliproxyaut
 	}()
 	body, errRead := io.ReadAll(resp.Body)
 	if errRead != nil {
-		return KiroBalance{}, nil, errRead
+		return KiroBalance{}, targetAuth, errRead
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return KiroBalance{}, nil, KiroHTTPStatusError{code: resp.StatusCode, msg: strings.TrimSpace(string(body))}
+		return KiroBalance{}, targetAuth, KiroHTTPStatusError{code: resp.StatusCode, msg: strings.TrimSpace(string(body))}
 	}
 	var payload kiroUsageLimitsResponse
 	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
-		return KiroBalance{}, nil, fmt.Errorf("kiro usage limits decode failed: %w", errUnmarshal)
+		return KiroBalance{}, targetAuth, fmt.Errorf("kiro usage limits decode failed: %w", errUnmarshal)
 	}
 	current := payload.currentUsage()
 	limit := payload.usageLimit()
