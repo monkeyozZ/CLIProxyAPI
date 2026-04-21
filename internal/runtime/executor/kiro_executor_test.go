@@ -330,6 +330,173 @@ func TestBuildKiroRequestBodyAddsPlaceholderToolForHistoryToolUse(t *testing.T) 
 	}
 }
 
+func TestBuildKiroRequestBodyToolOnlyAssistantHistoryUsesDotContent(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"messages": [
+			{"role":"user","content":[{"type":"text","text":"Call the tool"}]},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"local_tool","input":{"path":"a.txt"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`)
+
+	payload, err := buildKiroRequestBody(body, nil, "glm-5")
+	if err != nil {
+		t.Fatalf("buildKiroRequestBody: %v", err)
+	}
+
+	var decoded struct {
+		ConversationState struct {
+			History []struct {
+				AssistantResponseMessage struct {
+					Content string `json:"content"`
+				} `json:"assistantResponseMessage"`
+			} `json:"history"`
+		} `json:"conversationState"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(decoded.ConversationState.History) != 2 {
+		t.Fatalf("expected 2 history messages, got %d", len(decoded.ConversationState.History))
+	}
+	if got := decoded.ConversationState.History[1].AssistantResponseMessage.Content; got != "." {
+		t.Fatalf("expected tool-only assistant history content '.', got %q", got)
+	}
+}
+
+func TestBuildKiroRequestBodyNormalizesAndFiltersTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"tools": [
+			{"type":"web_search_20250305","name":"web_search"},
+			{"name":"` + strings.Repeat("a", 65) + `","description":"too long","input_schema":{"type":"object"}},
+			{"name":"Write","description":"","input_schema":{"required":null,"properties":null,"additionalProperties":null}}
+		],
+		"messages": [
+			{"role":"user","content":"hello"}
+		]
+	}`)
+
+	payload, err := buildKiroRequestBody(body, nil, "glm-5")
+	if err != nil {
+		t.Fatalf("buildKiroRequestBody: %v", err)
+	}
+
+	var decoded struct {
+		ConversationState struct {
+			CurrentMessage struct {
+				UserInputMessage struct {
+					UserInputMessageContext struct {
+						Tools []struct {
+							ToolSpecification struct {
+								Name        string         `json:"name"`
+								Description string         `json:"description"`
+								InputSchema map[string]any `json:"inputSchema"`
+							} `json:"toolSpecification"`
+						} `json:"tools"`
+					} `json:"userInputMessageContext"`
+				} `json:"userInputMessage"`
+			} `json:"currentMessage"`
+		} `json:"conversationState"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	tools := decoded.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools
+	if len(tools) != 1 {
+		t.Fatalf("expected only the supported Write tool to remain, got %#v", tools)
+	}
+	tool := tools[0].ToolSpecification
+	if tool.Name != "Write" {
+		t.Fatalf("expected tool name Write, got %q", tool.Name)
+	}
+	if !strings.Contains(tool.Description, "Tool: Write") {
+		t.Fatalf("expected fallback tool description, got %q", tool.Description)
+	}
+	if !strings.Contains(tool.Description, "Do NOT attempt to write all content at once.") {
+		t.Fatalf("expected Write suffix in description, got %q", tool.Description)
+	}
+	schema, ok := tool.InputSchema["json"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected nested input schema payload, got %#v", tool.InputSchema)
+	}
+	if got, _ := schema["$schema"].(string); got != "http://json-schema.org/draft-07/schema#" {
+		t.Fatalf("expected normalized $schema, got %#v", schema["$schema"])
+	}
+	if got, _ := schema["type"].(string); got != "object" {
+		t.Fatalf("expected normalized type object, got %#v", schema["type"])
+	}
+	if _, ok := schema["properties"].(map[string]any); !ok {
+		t.Fatalf("expected normalized properties object, got %#v", schema["properties"])
+	}
+	if got, ok := schema["additionalProperties"].(bool); !ok || !got {
+		t.Fatalf("expected additionalProperties=true, got %#v", schema["additionalProperties"])
+	}
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatalf("expected required array, got %#v", schema["required"])
+	}
+	if len(required) != 0 {
+		t.Fatalf("expected empty required array, got %#v", required)
+	}
+}
+
+func TestBuildKiroRequestBodyInjectsThinkingAndChunkedPolicyIntoHistory(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"thinking": {"type":"adaptive"},
+		"output_config": {"effort":"medium"},
+		"tools": [
+			{"name":"Write","description":"write file","input_schema":{"type":"object"}}
+		],
+		"messages": [
+			{"role":"user","content":"hello"}
+		]
+	}`)
+
+	payload, err := buildKiroRequestBody(body, nil, "glm-5-agentic")
+	if err != nil {
+		t.Fatalf("buildKiroRequestBody: %v", err)
+	}
+
+	var decoded struct {
+		ConversationState struct {
+			History []struct {
+				UserInputMessage struct {
+					Content string `json:"content"`
+				} `json:"userInputMessage"`
+				AssistantResponseMessage struct {
+					Content string `json:"content"`
+				} `json:"assistantResponseMessage"`
+			} `json:"history"`
+		} `json:"conversationState"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(decoded.ConversationState.History) != 4 {
+		t.Fatalf("expected system and agentic bootstrap pairs, got %d history entries", len(decoded.ConversationState.History))
+	}
+	systemUser := decoded.ConversationState.History[0].UserInputMessage.Content
+	if !strings.Contains(systemUser, "<thinking_mode>adaptive</thinking_mode><thinking_effort>medium</thinking_effort>") {
+		t.Fatalf("expected adaptive thinking prefix in history, got %q", systemUser)
+	}
+	if !strings.Contains(systemUser, "Complete all chunked operations without commentary.") {
+		t.Fatalf("expected chunked policy in history, got %q", systemUser)
+	}
+	if got := decoded.ConversationState.History[1].AssistantResponseMessage.Content; got != "I will follow these instructions." {
+		t.Fatalf("unexpected system assistant bootstrap: %q", got)
+	}
+	if got := decoded.ConversationState.History[3].AssistantResponseMessage.Content; got != "I will work autonomously following these principles." {
+		t.Fatalf("unexpected agentic assistant bootstrap: %q", got)
+	}
+}
+
 func TestBuildClaudeResponsePayloadIncludesToolUse(t *testing.T) {
 	t.Parallel()
 
@@ -414,7 +581,51 @@ func TestBuildClaudeResponsePayloadPrefersContextExceededOverToolUse(t *testing.
 	}
 }
 
-func TestBuildClaudeStreamEventsPreserveIncrementalToolUseDeltas(t *testing.T) {
+func TestBuildClaudeResponsePayloadIncludesUsageFromContextAndOutput(t *testing.T) {
+	t.Parallel()
+
+	payload := buildClaudeResponsePayload("claude-sonnet-4-6", []helps.KiroEvent{
+		{
+			Type: helps.KiroEventContextUsage,
+			ContextUsage: &helps.KiroContextUsageEvent{
+				ContextUsagePercentage: 50,
+			},
+		},
+		{
+			Type: helps.KiroEventAssistantResponse,
+			AssistantResponse: &helps.KiroAssistantResponseEvent{
+				Content: "Need a tool.",
+			},
+		},
+		{
+			Type: helps.KiroEventToolUse,
+			ToolUse: &helps.KiroToolUseEvent{
+				Name:      "get_weather",
+				ToolUseID: "toolu_1",
+				Input:     `{"city":"Shanghai"}`,
+				Stop:      true,
+			},
+		},
+	})
+
+	var decoded struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if decoded.Usage.InputTokens != 500000 {
+		t.Fatalf("expected input_tokens 500000, got %d", decoded.Usage.InputTokens)
+	}
+	if decoded.Usage.OutputTokens <= 0 {
+		t.Fatalf("expected output_tokens > 0, got %d", decoded.Usage.OutputTokens)
+	}
+}
+
+func TestBuildClaudeStreamEventsMergeToolUseDeltaOnStop(t *testing.T) {
 	t.Parallel()
 
 	streamEvents, err := buildClaudeStreamEvents("glm-5", []helps.KiroEvent{
@@ -514,17 +725,225 @@ func TestBuildClaudeStreamEventsPreserveIncrementalToolUseDeltas(t *testing.T) {
 	if starts[2].ContentBlock.Type != "text" || starts[2].Index != 2 {
 		t.Fatalf("unexpected second text block start: %#v", starts[2])
 	}
-	if len(toolDeltas) != 2 {
-		t.Fatalf("expected 2 tool deltas, got %d", len(toolDeltas))
+	if len(toolDeltas) != 1 {
+		t.Fatalf("expected 1 merged tool delta, got %d", len(toolDeltas))
 	}
-	if toolDeltas[0].Index != 1 || toolDeltas[0].Delta.PartialJSON != `{"city":"Shang` {
+	if toolDeltas[0].Index != 1 || toolDeltas[0].Delta.PartialJSON != `{"city":"Shanghai"}` {
 		t.Fatalf("unexpected first tool delta: %#v", toolDeltas[0])
-	}
-	if toolDeltas[1].Index != 1 || toolDeltas[1].Delta.PartialJSON != `hai"}` {
-		t.Fatalf("unexpected second tool delta: %#v", toolDeltas[1])
 	}
 	if final.Delta.StopReason != "tool_use" {
 		t.Fatalf("expected final stop_reason tool_use, got %q", final.Delta.StopReason)
+	}
+}
+
+func TestBuildClaudeStreamEventsEmitThinkingBlocks(t *testing.T) {
+	t.Parallel()
+
+	streamEvents, err := buildClaudeStreamEvents("claude-sonnet-4-6", []helps.KiroEvent{
+		{
+			Type: helps.KiroEventAssistantResponse,
+			AssistantResponse: &helps.KiroAssistantResponseEvent{
+				Content: "<thinking>\nNeed to inspect files</thinking>\n\nI can help.",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildClaudeStreamEvents: %v", err)
+	}
+
+	type contentBlockStart struct {
+		Type         string `json:"type"`
+		Index        int    `json:"index"`
+		ContentBlock struct {
+			Type string `json:"type"`
+		} `json:"content_block"`
+	}
+	type contentBlockDelta struct {
+		Type  string `json:"type"`
+		Index int    `json:"index"`
+		Delta struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+			Text     string `json:"text"`
+		} `json:"delta"`
+	}
+
+	var starts []contentBlockStart
+	var thinking string
+	var text string
+	for _, event := range streamEvents {
+		switch event.Name {
+		case "content_block_start":
+			var decoded contentBlockStart
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal content_block_start: %v", err)
+			}
+			starts = append(starts, decoded)
+		case "content_block_delta":
+			var decoded contentBlockDelta
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal content_block_delta: %v", err)
+			}
+			switch decoded.Delta.Type {
+			case "thinking_delta":
+				thinking += decoded.Delta.Thinking
+			case "text_delta":
+				text += decoded.Delta.Text
+			}
+		}
+	}
+
+	if len(starts) != 2 {
+		t.Fatalf("expected 2 content_block_start events, got %d", len(starts))
+	}
+	if starts[0].ContentBlock.Type != "thinking" || starts[0].Index != 0 {
+		t.Fatalf("unexpected thinking block start: %#v", starts[0])
+	}
+	if starts[1].ContentBlock.Type != "text" || starts[1].Index != 1 {
+		t.Fatalf("unexpected text block start: %#v", starts[1])
+	}
+	if thinking != "Need to inspect files" {
+		t.Fatalf("unexpected thinking content: %q", thinking)
+	}
+	if text != "I can help." {
+		t.Fatalf("unexpected text content: %q", text)
+	}
+}
+
+func TestBuildClaudeStreamEventsUsesContextUsageTokens(t *testing.T) {
+	t.Parallel()
+
+	streamEvents, err := buildClaudeStreamEvents("claude-sonnet-4-6", []helps.KiroEvent{
+		{
+			Type: helps.KiroEventContextUsage,
+			ContextUsage: &helps.KiroContextUsageEvent{
+				ContextUsagePercentage: 50,
+			},
+		},
+		{
+			Type: helps.KiroEventAssistantResponse,
+			AssistantResponse: &helps.KiroAssistantResponseEvent{
+				Content: "pong",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildClaudeStreamEvents: %v", err)
+	}
+
+	var messageStart struct {
+		Message struct {
+			Usage struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	var messageDelta struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	for _, event := range streamEvents {
+		switch event.Name {
+		case "message_start":
+			if err := json.Unmarshal(event.Data, &messageStart); err != nil {
+				t.Fatalf("unmarshal message_start: %v", err)
+			}
+		case "message_delta":
+			if err := json.Unmarshal(event.Data, &messageDelta); err != nil {
+				t.Fatalf("unmarshal message_delta: %v", err)
+			}
+		}
+	}
+	if messageStart.Message.Usage.InputTokens != 500000 {
+		t.Fatalf("expected message_start input_tokens 500000, got %d", messageStart.Message.Usage.InputTokens)
+	}
+	if messageStart.Message.Usage.OutputTokens != 1 {
+		t.Fatalf("expected message_start output_tokens 1, got %d", messageStart.Message.Usage.OutputTokens)
+	}
+	if messageDelta.Usage.InputTokens != 500000 {
+		t.Fatalf("expected message_delta input_tokens 500000, got %d", messageDelta.Usage.InputTokens)
+	}
+	if messageDelta.Usage.OutputTokens <= 0 {
+		t.Fatalf("expected message_delta output_tokens > 0, got %d", messageDelta.Usage.OutputTokens)
+	}
+}
+
+func TestBuildClaudeStreamEventsThinkingOnlyAddsPlaceholderTextAndMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	streamEvents, err := buildClaudeStreamEvents("claude-sonnet-4-6", []helps.KiroEvent{
+		{
+			Type: helps.KiroEventAssistantResponse,
+			AssistantResponse: &helps.KiroAssistantResponseEvent{
+				Content: "<thinking>\nNeed more time</thinking>",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildClaudeStreamEvents: %v", err)
+	}
+
+	var stopReason string
+	var text string
+	for _, event := range streamEvents {
+		switch event.Name {
+		case "content_block_delta":
+			var decoded struct {
+				Delta struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal content_block_delta: %v", err)
+			}
+			if decoded.Delta.Type == "text_delta" {
+				text += decoded.Delta.Text
+			}
+		case "message_delta":
+			var decoded struct {
+				Delta struct {
+					StopReason string `json:"stop_reason"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal message_delta: %v", err)
+			}
+			stopReason = decoded.Delta.StopReason
+		}
+	}
+
+	if stopReason != "max_tokens" {
+		t.Fatalf("expected stop_reason max_tokens, got %q", stopReason)
+	}
+	if text != " " {
+		t.Fatalf("expected placeholder text delta, got %q", text)
+	}
+}
+
+func TestParseAnthropicAssistantMessagePreservesWebSearchHistoryText(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := parseAnthropicAssistantMessage(json.RawMessage(`[
+		{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"rust async"}},
+		{"type":"web_search_tool_result","content":[
+			{"type":"web_search_result","title":"Rust Async","url":"https://example.com/rust","encrypted_content":"Async guide","page_age":"April 21, 2026"}
+		]}
+	]`))
+	if err != nil {
+		t.Fatalf("parseAnthropicAssistantMessage: %v", err)
+	}
+	if !strings.Contains(parsed.Text, "Rust Async: https://example.com/rust") {
+		t.Fatalf("expected web search title/url in parsed text, got %q", parsed.Text)
+	}
+	if !strings.Contains(parsed.Text, "Date: April 21, 2026") {
+		t.Fatalf("expected page age in parsed text, got %q", parsed.Text)
+	}
+	if !strings.Contains(parsed.Text, "Async guide") {
+		t.Fatalf("expected snippet in parsed text, got %q", parsed.Text)
 	}
 }
 

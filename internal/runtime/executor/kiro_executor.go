@@ -9,6 +9,8 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -280,9 +282,12 @@ func (e *KiroExecutor) executeKiroEvents(ctx context.Context, auth *cliproxyauth
 }
 
 type anthropicMessagesRequest struct {
-	System   json.RawMessage    `json:"system"`
-	Messages []anthropicMessage `json:"messages"`
-	Tools    []anthropicTool    `json:"tools"`
+	System       json.RawMessage        `json:"system"`
+	Messages     []anthropicMessage     `json:"messages"`
+	Tools        []anthropicTool        `json:"tools"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+	Metadata     *anthropicRequestMeta  `json:"metadata,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -294,6 +299,20 @@ type anthropicTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
+	Type        string          `json:"type,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort"`
+}
+
+type anthropicRequestMeta struct {
+	UserID string `json:"user_id"`
 }
 
 type anthropicContentBlock struct {
@@ -322,11 +341,12 @@ type kiroRequestPayload struct {
 }
 
 type kiroConversationState struct {
-	AgentTaskType   string               `json:"agentTaskType,omitempty"`
-	ChatTriggerType string               `json:"chatTriggerType,omitempty"`
-	ConversationID  string               `json:"conversationId"`
-	CurrentMessage  kiroCurrentMessage   `json:"currentMessage"`
-	History         []kiroHistoryMessage `json:"history,omitempty"`
+	AgentContinuationID string               `json:"agentContinuationId,omitempty"`
+	AgentTaskType       string               `json:"agentTaskType,omitempty"`
+	ChatTriggerType     string               `json:"chatTriggerType,omitempty"`
+	ConversationID      string               `json:"conversationId"`
+	CurrentMessage      kiroCurrentMessage   `json:"currentMessage"`
+	History             []kiroHistoryMessage `json:"history,omitempty"`
 }
 
 type kiroCurrentMessage struct {
@@ -403,6 +423,19 @@ type parsedAnthropicAssistantMessage struct {
 	ToolUses []kiroToolUseEntry
 }
 
+const kiroSystemChunkedPolicy = "When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary."
+
+const kiroAgenticSystemPrompt = "You are an autonomous coding agent. Follow these principles:\n1. Work continuously until the task is fully complete.\n2. Use tools proactively without asking for permission.\n3. When encountering errors, debug and fix them autonomously.\n4. Break complex tasks into steps and execute them sequentially.\n5. Verify your work by reading files after writing them.\n6. Never ask the user for confirmation mid-task just proceed.\n7. If a tool call fails, try alternative approaches before giving up.\n8. Prefer making changes directly over explaining what you would do."
+
+const kiroWriteToolDescriptionSuffix = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once."
+
+const kiroEditToolDescriptionSuffix = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder."
+
+const kiroThinkingStartTag = "<thinking>"
+const kiroThinkingEndTag = "</thinking>"
+const kiroThinkingDelimitedEndTag = "</thinking>\n\n"
+const kiroThinkingQuoteChars = "`\"'\\#!@$%^&*()-_=+[]{};:<>,.?/"
+
 func buildKiroRequestBody(body []byte, auth *cliproxyauth.Auth, baseModel string) ([]byte, error) {
 	modelID, ok := helps.KiroMapModel(baseModel)
 	if !ok {
@@ -421,34 +454,18 @@ func buildKiroRequestBody(body []byte, auth *cliproxyauth.Auth, baseModel string
 	if err != nil {
 		return nil, err
 	}
+	if err := validateKiroTrailingMessageContent(messages[len(messages)-1].Content); err != nil {
+		return nil, err
+	}
 
-	history := make([]kiroHistoryMessage, 0, len(messages)+2)
-	systemText, err := extractAnthropicSystemText(req.System)
+	history, err := buildKiroHistory(req, messages, modelID, isKiroAgenticModel(baseModel))
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(systemText) != "" {
-		history = append(history, buildKiroHistoryUserMessage(systemText, modelID))
-		history = append(history, buildKiroHistoryAssistantMessage("I will follow these instructions.", nil))
-	}
 
-	for _, message := range messages[:len(messages)-1] {
-		switch {
-		case strings.EqualFold(message.Role, "user"):
-			parsed, err := parseAnthropicUserMessage(message.Content)
-			if err != nil {
-				return nil, err
-			}
-			history = append(history, buildKiroHistoryUserMessageWithResults(parsed.Text, modelID, parsed.ToolResults, parsed.Images))
-		case strings.EqualFold(message.Role, "assistant"):
-			parsed, err := parseAnthropicAssistantMessage(message.Content)
-			if err != nil {
-				return nil, err
-			}
-			history = append(history, buildKiroHistoryAssistantMessage(parsed.Text, parsed.ToolUses))
-		default:
-			return nil, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("unsupported kiro message role: %s", message.Role)}
-		}
+	conversationID := extractKiroConversationID(req.Metadata)
+	if conversationID == "" {
+		conversationID = uuid.NewString()
 	}
 
 	currentParsed, err := parseAnthropicUserMessage(messages[len(messages)-1].Content)
@@ -461,7 +478,7 @@ func buildKiroRequestBody(body []byte, auth *cliproxyauth.Auth, baseModel string
 	tools := convertAnthropicTools(req.Tools)
 	tools = appendHistoryPlaceholderTools(tools, history)
 
-	currentText := currentParsed.Text
+	currentText := nonEmptyKiroContent(currentParsed.Text, len(currentParsed.Images) > 0 || len(validToolResults) > 0)
 	if strings.TrimSpace(currentText) == "" {
 		currentText = "."
 	}
@@ -471,9 +488,10 @@ func buildKiroRequestBody(body []byte, auth *cliproxyauth.Auth, baseModel string
 
 	payload := kiroRequestPayload{
 		ConversationState: kiroConversationState{
-			AgentTaskType:   helps.KiroAgentMode(baseModel),
-			ChatTriggerType: "MANUAL",
-			ConversationID:  "conv-" + uuid.NewString(),
+			AgentContinuationID: uuid.NewString(),
+			AgentTaskType:       helps.KiroAgentMode(baseModel),
+			ChatTriggerType:     "MANUAL",
+			ConversationID:      conversationID,
 			CurrentMessage: kiroCurrentMessage{
 				UserInputMessage: currentMessage,
 			},
@@ -484,6 +502,232 @@ func buildKiroRequestBody(body []byte, auth *cliproxyauth.Auth, baseModel string
 		payload.ProfileARN = strings.TrimSpace(creds.ProfileARN)
 	}
 	return json.Marshal(payload)
+}
+
+func buildKiroHistory(req anthropicMessagesRequest, messages []anthropicMessage, modelID string, isAgentic bool) ([]kiroHistoryMessage, error) {
+	history := make([]kiroHistoryMessage, 0, len(messages)+4)
+
+	thinkingPrefix := generateKiroThinkingPrefix(req.Thinking, req.OutputConfig)
+	shouldInjectChunkedPolicy := hasWriteOrEditTool(req.Tools)
+	systemText, err := extractAnthropicSystemText(req.System)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(systemText) != "" {
+		systemContent := systemText
+		if shouldInjectChunkedPolicy {
+			systemContent = systemContent + "\n" + kiroSystemChunkedPolicy
+		}
+		if thinkingPrefix != "" && !hasKiroThinkingTags(systemContent) {
+			systemContent = thinkingPrefix + "\n" + systemContent
+		}
+		history = append(history, buildKiroHistoryUserMessage(systemContent, modelID))
+		history = append(history, buildKiroHistoryAssistantMessage("I will follow these instructions.", nil))
+	} else if thinkingPrefix != "" || shouldInjectChunkedPolicy {
+		parts := make([]string, 0, 2)
+		if thinkingPrefix != "" {
+			parts = append(parts, thinkingPrefix)
+		}
+		if shouldInjectChunkedPolicy {
+			parts = append(parts, kiroSystemChunkedPolicy)
+		}
+		history = append(history, buildKiroHistoryUserMessage(strings.Join(parts, "\n"), modelID))
+		history = append(history, buildKiroHistoryAssistantMessage("I will follow these instructions.", nil))
+	}
+
+	if isAgentic {
+		history = append(history, buildKiroHistoryUserMessage(kiroAgenticSystemPrompt, modelID))
+		history = append(history, buildKiroHistoryAssistantMessage("I will work autonomously following these principles.", nil))
+	}
+
+	historyEndIndex := len(messages) - 1
+	userBuffer := make([]anthropicMessage, 0, 4)
+	assistantBuffer := make([]anthropicMessage, 0, 4)
+
+	for _, message := range messages[:historyEndIndex] {
+		switch {
+		case strings.EqualFold(message.Role, "user"):
+			if len(assistantBuffer) > 0 {
+				merged, errMerge := mergeAnthropicAssistantMessages(assistantBuffer)
+				if errMerge != nil {
+					return nil, errMerge
+				}
+				history = append(history, merged)
+				assistantBuffer = assistantBuffer[:0]
+			}
+			userBuffer = append(userBuffer, message)
+		case strings.EqualFold(message.Role, "assistant"):
+			if len(userBuffer) > 0 {
+				merged, errMerge := mergeAnthropicUserMessages(userBuffer, modelID)
+				if errMerge != nil {
+					return nil, errMerge
+				}
+				history = append(history, merged)
+				userBuffer = userBuffer[:0]
+			}
+			assistantBuffer = append(assistantBuffer, message)
+		default:
+			return nil, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("unsupported kiro message role: %s", message.Role)}
+		}
+	}
+
+	if len(assistantBuffer) > 0 {
+		merged, errMerge := mergeAnthropicAssistantMessages(assistantBuffer)
+		if errMerge != nil {
+			return nil, errMerge
+		}
+		history = append(history, merged)
+	}
+	if len(userBuffer) > 0 {
+		merged, errMerge := mergeAnthropicUserMessages(userBuffer, modelID)
+		if errMerge != nil {
+			return nil, errMerge
+		}
+		history = append(history, merged)
+		history = append(history, buildKiroHistoryAssistantMessage("OK", nil))
+	}
+
+	return history, nil
+}
+
+func mergeAnthropicUserMessages(messages []anthropicMessage, modelID string) (kiroHistoryMessage, error) {
+	textParts := make([]string, 0, len(messages))
+	images := make([]kiroImage, 0)
+	toolResults := make([]kiroToolResult, 0)
+	for _, message := range messages {
+		parsed, err := parseAnthropicUserMessage(message.Content)
+		if err != nil {
+			return kiroHistoryMessage{}, err
+		}
+		if parsed.Text != "" {
+			textParts = append(textParts, parsed.Text)
+		}
+		images = append(images, parsed.Images...)
+		toolResults = append(toolResults, parsed.ToolResults...)
+	}
+	content := nonEmptyKiroContent(strings.Join(textParts, "\n"), len(images) > 0 || len(toolResults) > 0)
+	msg := buildKiroUserInputMessage(content, modelID, images)
+	msg.UserInputMessageContext.ToolResults = toolResults
+	return kiroHistoryMessage{UserInputMessage: &msg}, nil
+}
+
+func mergeAnthropicAssistantMessages(messages []anthropicMessage) (kiroHistoryMessage, error) {
+	contentParts := make([]string, 0, len(messages))
+	toolUses := make([]kiroToolUseEntry, 0)
+	for _, message := range messages {
+		parsed, err := parseAnthropicAssistantMessage(message.Content)
+		if err != nil {
+			return kiroHistoryMessage{}, err
+		}
+		if strings.TrimSpace(parsed.Text) != "" {
+			contentParts = append(contentParts, parsed.Text)
+		}
+		toolUses = append(toolUses, parsed.ToolUses...)
+	}
+	content := strings.Join(contentParts, "\n\n")
+	if strings.TrimSpace(content) == "" && len(toolUses) > 0 {
+		content = "."
+	}
+	return buildKiroHistoryAssistantMessage(content, toolUses), nil
+}
+
+func validateKiroTrailingMessageContent(raw json.RawMessage) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return statusErr{code: http.StatusBadRequest, msg: "kiro last message content is empty"}
+	}
+	var text string
+	if err := json.Unmarshal(trimmed, &text); err == nil {
+		if strings.TrimSpace(text) != "" {
+			return nil
+		}
+		return statusErr{code: http.StatusBadRequest, msg: "kiro last message content is empty"}
+	}
+	blocks, err := decodeAnthropicContentBlocks(trimmed)
+	if err != nil {
+		return statusErr{code: http.StatusBadRequest, msg: "unsupported kiro message content"}
+	}
+	for _, block := range blocks {
+		switch strings.ToLower(block.Type) {
+		case "", "text":
+			if strings.TrimSpace(block.Text) != "" {
+				return nil
+			}
+		case "image", "tool_use", "tool_result":
+			return nil
+		}
+	}
+	return statusErr{code: http.StatusBadRequest, msg: "kiro last message content is empty"}
+}
+
+func extractKiroConversationID(meta *anthropicRequestMeta) string {
+	if meta == nil {
+		return ""
+	}
+	userID := strings.TrimSpace(meta.UserID)
+	if userID == "" {
+		return ""
+	}
+	sessionMarker := "session_"
+	pos := strings.Index(userID, sessionMarker)
+	if pos < 0 {
+		return ""
+	}
+	sessionPart := userID[pos+len(sessionMarker):]
+	if len(sessionPart) < 36 {
+		return ""
+	}
+	candidate := sessionPart[:36]
+	if strings.Count(candidate, "-") != 4 {
+		return ""
+	}
+	return candidate
+}
+
+func isKiroAgenticModel(model string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(model)), "-agentic")
+}
+
+func generateKiroThinkingPrefix(cfg *anthropicThinking, output *anthropicOutputConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Type)) {
+	case "enabled":
+		return fmt.Sprintf("<thinking_mode>enabled</thinking_mode><max_thinking_length>%d</max_thinking_length>", cfg.BudgetTokens)
+	case "adaptive":
+		effort := "high"
+		if output != nil {
+			switch strings.ToLower(strings.TrimSpace(output.Effort)) {
+			case "low", "medium", "high":
+				effort = strings.ToLower(strings.TrimSpace(output.Effort))
+			}
+		}
+		return fmt.Sprintf("<thinking_mode>adaptive</thinking_mode><thinking_effort>%s</thinking_effort>", effort)
+	default:
+		return ""
+	}
+}
+
+func hasKiroThinkingTags(content string) bool {
+	return strings.Contains(content, "<thinking_mode>") || strings.Contains(content, "<max_thinking_length>")
+}
+
+func hasWriteOrEditTool(tools []anthropicTool) bool {
+	for _, tool := range tools {
+		switch strings.TrimSpace(tool.Name) {
+		case "Write", "Edit":
+			return true
+		}
+	}
+	return false
+}
+
+func nonEmptyKiroContent(content string, hasNonTextPayload bool) string {
+	if hasNonTextPayload && strings.TrimSpace(content) == "" {
+		return "."
+	}
+	return content
 }
 
 func trimTrailingAssistantPrefill(messages []anthropicMessage) ([]anthropicMessage, error) {
@@ -562,7 +806,7 @@ func parseAnthropicUserMessage(raw json.RawMessage) (parsedAnthropicUserMessage,
 		case "thinking":
 			continue
 		default:
-			return parsedAnthropicUserMessage{}, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("kiro does not support content block type %s yet", block.Type)}
+			continue
 		}
 	}
 	return parsedAnthropicUserMessage{
@@ -578,6 +822,7 @@ func parseAnthropicAssistantMessage(raw json.RawMessage) (parsedAnthropicAssista
 		return parsedAnthropicAssistantMessage{}, statusErr{code: http.StatusBadRequest, msg: "unsupported kiro message content"}
 	}
 	parts := make([]string, 0, len(blocks))
+	thinkingParts := make([]string, 0, len(blocks))
 	toolUses := make([]kiroToolUseEntry, 0)
 	for _, block := range blocks {
 		switch strings.ToLower(block.Type) {
@@ -586,7 +831,9 @@ func parseAnthropicAssistantMessage(raw json.RawMessage) (parsedAnthropicAssista
 				parts = append(parts, block.Text)
 			}
 		case "thinking":
-			continue
+			if block.Thinking != "" {
+				thinkingParts = append(thinkingParts, block.Thinking)
+			}
 		case "tool_use":
 			if strings.TrimSpace(block.ID) == "" || strings.TrimSpace(block.Name) == "" {
 				continue
@@ -596,14 +843,86 @@ func parseAnthropicAssistantMessage(raw json.RawMessage) (parsedAnthropicAssista
 				Name:      block.Name,
 				ToolUseID: block.ID,
 			})
+		case "server_tool_use":
+			continue
+		case "web_search_tool_result":
+			if text := extractAnthropicWebSearchToolResultText(block.Content); text != "" {
+				parts = append(parts, text)
+			}
 		default:
-			return parsedAnthropicAssistantMessage{}, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("kiro does not support content block type %s yet", block.Type)}
+			continue
 		}
 	}
+	textContent := strings.Join(parts, "")
+	thinkingContent := strings.Join(thinkingParts, "")
+	finalContent := textContent
+	if thinkingContent != "" {
+		if textContent != "" {
+			finalContent = fmt.Sprintf("<thinking>%s</thinking>\n\n%s", thinkingContent, textContent)
+		} else {
+			finalContent = fmt.Sprintf("<thinking>%s</thinking>", thinkingContent)
+		}
+	} else if textContent == "" && len(toolUses) > 0 {
+		finalContent = "."
+	}
 	return parsedAnthropicAssistantMessage{
-		Text:     strings.Join(parts, "\n"),
+		Text:     finalContent,
 		ToolUses: toolUses,
 	}, nil
+}
+
+func extractAnthropicWebSearchToolResultText(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var results []map[string]any
+	if err := json.Unmarshal(raw, &results); err != nil {
+		return ""
+	}
+	var builder strings.Builder
+	for _, result := range results {
+		resultType, _ := result["type"].(string)
+		if resultType != "web_search_result" {
+			continue
+		}
+		url, _ := result["url"].(string)
+		url = strings.TrimSpace(url)
+		if url == "" {
+			continue
+		}
+		title := stripAnthropicControlChars(stringValue(result, "title"))
+		snippet := stripAnthropicControlChars(stringValue(result, "encrypted_content"))
+		pageAge := stripAnthropicControlChars(stringValue(result, "page_age"))
+		if title == "" {
+			builder.WriteString(url)
+			builder.WriteByte('\n')
+		} else {
+			builder.WriteString(title)
+			builder.WriteString(": ")
+			builder.WriteString(url)
+			builder.WriteByte('\n')
+		}
+		if pageAge != "" {
+			builder.WriteString("Date: ")
+			builder.WriteString(pageAge)
+			builder.WriteByte('\n')
+		}
+		if snippet != "" {
+			builder.WriteString(snippet)
+			builder.WriteByte('\n')
+		}
+		builder.WriteByte('\n')
+	}
+	return builder.String()
+}
+
+func stripAnthropicControlChars(text string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, text)
 }
 
 func decodeAnthropicContentBlocks(raw json.RawMessage) ([]anthropicContentBlock, error) {
@@ -727,24 +1046,32 @@ func normalizeKiroImageFormat(mediaType string) (string, bool) {
 
 func convertAnthropicTools(tools []anthropicTool) []kiroTool {
 	out := make([]kiroTool, 0, len(tools))
-	seen := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {
 		name := strings.TrimSpace(tool.Name)
-		if name == "" {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(tool.Type)), "web_search") {
 			continue
 		}
-		lower := strings.ToLower(name)
-		if _, ok := seen[lower]; ok {
+		if name == "" || len(name) > 64 {
 			continue
 		}
-		seen[lower] = struct{}{}
-		schema := parseRawJSONValue(tool.InputSchema, map[string]any{
+		description := strings.TrimSpace(tool.Description)
+		if description == "" {
+			description = "Tool: " + name
+		}
+		switch name {
+		case "Write":
+			description += "\n" + kiroWriteToolDescriptionSuffix
+		case "Edit":
+			description += "\n" + kiroEditToolDescriptionSuffix
+		}
+		schema := normalizeKiroJSONSchema(parseRawJSONValue(tool.InputSchema, map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
-		})
+			"required":   []any{},
+		}))
 		out = append(out, kiroTool{
 			ToolSpecification: kiroToolSpecification{
-				Description: strings.TrimSpace(tool.Description),
+				Description: description,
 				InputSchema: kiroInputSchema{JSON: schema},
 				Name:        name,
 			},
@@ -777,16 +1104,68 @@ func appendHistoryPlaceholderTools(tools []kiroTool, history []kiroHistoryMessag
 func placeholderKiroTool(name string) kiroTool {
 	return kiroTool{
 		ToolSpecification: kiroToolSpecification{
-			Description: "Placeholder tool definition for history replay.",
+			Description: "Tool used in conversation history",
 			InputSchema: kiroInputSchema{
-				JSON: map[string]any{
+				JSON: normalizeKiroJSONSchema(map[string]any{
 					"type":       "object",
 					"properties": map[string]any{},
-				},
+					"required":   []any{},
+				}),
 			},
 			Name: name,
 		},
 	}
+}
+
+func normalizeKiroJSONSchema(schema any) any {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return map[string]any{
+			"$schema":              "http://json-schema.org/draft-07/schema#",
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"required":             []any{},
+			"additionalProperties": true,
+		}
+	}
+
+	schemaName, _ := object["$schema"].(string)
+	if strings.TrimSpace(schemaName) == "" {
+		object["$schema"] = "http://json-schema.org/draft-07/schema#"
+	}
+	typeName, _ := object["type"].(string)
+	if strings.TrimSpace(typeName) == "" {
+		object["type"] = "object"
+	}
+	if _, ok := object["properties"].(map[string]any); !ok {
+		object["properties"] = map[string]any{}
+	}
+	switch required := object["required"].(type) {
+	case []any:
+		filtered := make([]any, 0, len(required))
+		for _, item := range required {
+			if value, ok := item.(string); ok && strings.TrimSpace(value) != "" {
+				filtered = append(filtered, value)
+			}
+		}
+		object["required"] = filtered
+	case []string:
+		filtered := make([]any, 0, len(required))
+		for _, item := range required {
+			if strings.TrimSpace(item) != "" {
+				filtered = append(filtered, item)
+			}
+		}
+		object["required"] = filtered
+	default:
+		object["required"] = []any{}
+	}
+	switch object["additionalProperties"].(type) {
+	case bool, map[string]any:
+	default:
+		object["additionalProperties"] = true
+	}
+	return object
 }
 
 func buildKiroUserInputMessage(content, modelID string, images []kiroImage) kiroUserMessage {
@@ -893,19 +1272,40 @@ type kiroClaudeBlock struct {
 }
 
 type kiroClaudeResponse struct {
-	Blocks     []kiroClaudeBlock
-	StopReason string
+	Blocks       []kiroClaudeBlock
+	StopReason   string
+	InputTokens  int
+	OutputTokens int
 }
 
 type kiroPendingToolUse struct {
 	BlockIndex int
 	Name       string
 	Builder    strings.Builder
+	Stopped    bool
 }
 
 type claudeStreamEvent struct {
 	Name string
 	Data []byte
+}
+
+type kiroClaudeStreamBuilder struct {
+	Model                       string
+	Events                      []claudeStreamEvent
+	InputTokens                 int
+	OutputTokens                int
+	StopReason                  string
+	OpenTextIndex               int
+	NextBlockIndex              int
+	ThinkingBuffer              string
+	InThinkingBlock             bool
+	ThinkingExtracted           bool
+	ThinkingBlockIndex          int
+	StripThinkingLeadingNewline bool
+	PendingTools                map[string]*kiroPendingToolUse
+	HasThinkingBlock            bool
+	HasNonThinkingBlocks        bool
 }
 
 func kiroStopReasonPriority(reason string) int {
@@ -945,7 +1345,149 @@ func parseKiroToolInput(raw string) (any, string) {
 	return parsed, normalized
 }
 
-func collectKiroClaudeResponse(events []helps.KiroEvent) kiroClaudeResponse {
+func kiroContextWindowSize(model string) int {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if (strings.Contains(model, "opus") || strings.Contains(model, "sonnet")) &&
+		(strings.Contains(model, "4-6") || strings.Contains(model, "4.6")) {
+		return 1_000_000
+	}
+	return 200_000
+}
+
+func estimateKiroTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	chineseCount := 0
+	otherCount := 0
+	for _, r := range text {
+		if r >= '\u4E00' && r <= '\u9FFF' {
+			chineseCount++
+			continue
+		}
+		otherCount++
+	}
+	chineseTokens := (chineseCount*2 + 2) / 3
+	otherTokens := (otherCount + 3) / 4
+	total := chineseTokens + otherTokens
+	if total <= 0 {
+		return 1
+	}
+	return total
+}
+
+func kiroInputTokensFromEvents(model string, events []helps.KiroEvent) int {
+	contextWindow := kiroContextWindowSize(model)
+	inputTokens := 0
+	for _, event := range events {
+		if event.Type != helps.KiroEventContextUsage || event.ContextUsage == nil {
+			continue
+		}
+		inputTokens = int(event.ContextUsage.ContextUsagePercentage * float64(contextWindow) / 100.0)
+	}
+	return inputTokens
+}
+
+func kiroOutputTokensFromBlocks(blocks []kiroClaudeBlock) int {
+	total := 0
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			total += estimateKiroTokens(block.Text)
+		case "tool_use":
+			if block.RawInput != "" {
+				total += (len(block.RawInput) + 3) / 4
+			}
+		}
+	}
+	return total
+}
+
+func floorKiroCharBoundary(text string, index int) int {
+	if index <= 0 {
+		return 0
+	}
+	if index >= len(text) {
+		return len(text)
+	}
+	for index > 0 && !utf8.ValidString(text[:index]) {
+		index--
+	}
+	return index
+}
+
+func isKiroQuoteChar(buffer string, pos int) bool {
+	if pos < 0 || pos >= len(buffer) {
+		return false
+	}
+	return strings.ContainsRune(kiroThinkingQuoteChars, rune(buffer[pos]))
+}
+
+func findKiroThinkingStartTag(buffer string) int {
+	searchStart := 0
+	for {
+		pos := strings.Index(buffer[searchStart:], kiroThinkingStartTag)
+		if pos < 0 {
+			return -1
+		}
+		absolutePos := searchStart + pos
+		hasQuoteBefore := absolutePos > 0 && isKiroQuoteChar(buffer, absolutePos-1)
+		hasQuoteAfter := isKiroQuoteChar(buffer, absolutePos+len(kiroThinkingStartTag))
+		if !hasQuoteBefore && !hasQuoteAfter {
+			return absolutePos
+		}
+		searchStart = absolutePos + 1
+	}
+}
+
+func findKiroThinkingEndTag(buffer string) int {
+	searchStart := 0
+	for {
+		pos := strings.Index(buffer[searchStart:], kiroThinkingEndTag)
+		if pos < 0 {
+			return -1
+		}
+		absolutePos := searchStart + pos
+		afterPos := absolutePos + len(kiroThinkingEndTag)
+		hasQuoteBefore := absolutePos > 0 && isKiroQuoteChar(buffer, absolutePos-1)
+		hasQuoteAfter := isKiroQuoteChar(buffer, afterPos)
+		if hasQuoteBefore || hasQuoteAfter {
+			searchStart = absolutePos + 1
+			continue
+		}
+		if len(buffer[afterPos:]) < 2 {
+			return -1
+		}
+		if strings.HasPrefix(buffer[afterPos:], "\n\n") {
+			return absolutePos
+		}
+		searchStart = absolutePos + 1
+	}
+}
+
+func findKiroThinkingEndTagAtBufferEnd(buffer string) int {
+	searchStart := 0
+	for {
+		pos := strings.Index(buffer[searchStart:], kiroThinkingEndTag)
+		if pos < 0 {
+			return -1
+		}
+		absolutePos := searchStart + pos
+		afterPos := absolutePos + len(kiroThinkingEndTag)
+		hasQuoteBefore := absolutePos > 0 && isKiroQuoteChar(buffer, absolutePos-1)
+		hasQuoteAfter := isKiroQuoteChar(buffer, afterPos)
+		if hasQuoteBefore || hasQuoteAfter {
+			searchStart = absolutePos + 1
+			continue
+		}
+		if strings.TrimSpace(buffer[afterPos:]) == "" {
+			return absolutePos
+		}
+		searchStart = absolutePos + 1
+	}
+}
+
+func collectKiroClaudeResponse(model string, events []helps.KiroEvent) kiroClaudeResponse {
 	response := kiroClaudeResponse{
 		Blocks:     make([]kiroClaudeBlock, 0, len(events)),
 		StopReason: "end_turn",
@@ -1015,12 +1557,14 @@ func collectKiroClaudeResponse(events []helps.KiroEvent) kiroClaudeResponse {
 		response.Blocks[state.BlockIndex].Input = parsedInput
 		response.Blocks[state.BlockIndex].RawInput = normalizedRaw
 	}
+	response.InputTokens = kiroInputTokensFromEvents(model, events)
+	response.OutputTokens = kiroOutputTokensFromBlocks(response.Blocks)
 
 	return response
 }
 
 func buildClaudeResponsePayload(model string, events []helps.KiroEvent) []byte {
-	response := collectKiroClaudeResponse(events)
+	response := collectKiroClaudeResponse(model, events)
 	content := make([]map[string]any, 0, len(response.Blocks))
 	for _, block := range response.Blocks {
 		switch block.Type {
@@ -1053,8 +1597,8 @@ func buildClaudeResponsePayload(model string, events []helps.KiroEvent) []byte {
 		"stop_sequence": nil,
 		"content":       content,
 		"usage": map[string]any{
-			"input_tokens":  0,
-			"output_tokens": 0,
+			"input_tokens":  response.InputTokens,
+			"output_tokens": response.OutputTokens,
 		},
 	})
 	return payload
@@ -1100,11 +1644,438 @@ func buildClaudeSSEChunks(model string, events []helps.KiroEvent) ([][]byte, err
 	return chunks, nil
 }
 
-func buildClaudeStreamEvents(model string, events []helps.KiroEvent) ([]claudeStreamEvent, error) {
-	messageID := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	streamEvents := make([]claudeStreamEvent, 0, len(events)*3+3)
+func newKiroClaudeStreamBuilder(model string, inputTokens int) *kiroClaudeStreamBuilder {
+	return &kiroClaudeStreamBuilder{
+		Model:              model,
+		InputTokens:        inputTokens,
+		StopReason:         "end_turn",
+		OpenTextIndex:      -1,
+		ThinkingBlockIndex: -1,
+		PendingTools:       make(map[string]*kiroPendingToolUse),
+	}
+}
 
-	messageStart, err := json.Marshal(map[string]any{
+func (b *kiroClaudeStreamBuilder) nextBlockIndex() int {
+	index := b.NextBlockIndex
+	b.NextBlockIndex++
+	return index
+}
+
+func (b *kiroClaudeStreamBuilder) appendEvent(name string, payload map[string]any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	b.Events = append(b.Events, claudeStreamEvent{Name: name, Data: data})
+	return nil
+}
+
+func (b *kiroClaudeStreamBuilder) startTextBlock() error {
+	if b.OpenTextIndex >= 0 {
+		return nil
+	}
+	b.OpenTextIndex = b.nextBlockIndex()
+	return b.appendEvent("content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": b.OpenTextIndex,
+		"content_block": map[string]any{
+			"type": "text",
+			"text": "",
+		},
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) emitTextDelta(text string) error {
+	if text == "" {
+		return nil
+	}
+	if err := b.startTextBlock(); err != nil {
+		return err
+	}
+	b.HasNonThinkingBlocks = true
+	return b.appendEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": b.OpenTextIndex,
+		"delta": map[string]any{
+			"type": "text_delta",
+			"text": text,
+		},
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) closeTextBlock() error {
+	if b.OpenTextIndex < 0 {
+		return nil
+	}
+	index := b.OpenTextIndex
+	b.OpenTextIndex = -1
+	return b.appendEvent("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": index,
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) startThinkingBlock() error {
+	if b.ThinkingBlockIndex >= 0 {
+		return nil
+	}
+	b.ThinkingBlockIndex = b.nextBlockIndex()
+	b.HasThinkingBlock = true
+	return b.appendEvent("content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": b.ThinkingBlockIndex,
+		"content_block": map[string]any{
+			"type":     "thinking",
+			"thinking": "",
+		},
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) emitThinkingDelta(thinking string) error {
+	if b.ThinkingBlockIndex < 0 {
+		return nil
+	}
+	return b.appendEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": b.ThinkingBlockIndex,
+		"delta": map[string]any{
+			"type":     "thinking_delta",
+			"thinking": thinking,
+		},
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) closeThinkingBlock() error {
+	if b.ThinkingBlockIndex < 0 {
+		return nil
+	}
+	index := b.ThinkingBlockIndex
+	b.ThinkingBlockIndex = -1
+	return b.appendEvent("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": index,
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) startToolBlock(toolUseID, name string) (*kiroPendingToolUse, error) {
+	if state, ok := b.PendingTools[toolUseID]; ok {
+		return state, nil
+	}
+	state := &kiroPendingToolUse{
+		BlockIndex: b.nextBlockIndex(),
+		Name:       name,
+	}
+	b.PendingTools[toolUseID] = state
+	b.HasNonThinkingBlocks = true
+	if err := b.appendEvent("content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": state.BlockIndex,
+		"content_block": map[string]any{
+			"type":  "tool_use",
+			"id":    toolUseID,
+			"name":  name,
+			"input": map[string]any{},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (b *kiroClaudeStreamBuilder) emitToolDelta(state *kiroPendingToolUse, raw string) error {
+	if state == nil || raw == "" {
+		return nil
+	}
+	return b.appendEvent("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": state.BlockIndex,
+		"delta": map[string]any{
+			"type":         "input_json_delta",
+			"partial_json": raw,
+		},
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) closeToolBlock(state *kiroPendingToolUse) error {
+	if state == nil || state.Stopped {
+		return nil
+	}
+	state.Stopped = true
+	return b.appendEvent("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": state.BlockIndex,
+	})
+}
+
+func (b *kiroClaudeStreamBuilder) processAssistantResponse(content string) error {
+	if content == "" {
+		return nil
+	}
+	b.OutputTokens += estimateKiroTokens(content)
+	b.ThinkingBuffer += content
+
+	for {
+		switch {
+		case !b.InThinkingBlock && !b.ThinkingExtracted:
+			startPos := findKiroThinkingStartTag(b.ThinkingBuffer)
+			if startPos >= 0 {
+				beforeThinking := b.ThinkingBuffer[:startPos]
+				if beforeThinking != "" && strings.TrimSpace(beforeThinking) != "" {
+					if err := b.emitTextDelta(beforeThinking); err != nil {
+						return err
+					}
+				}
+				b.InThinkingBlock = true
+				b.StripThinkingLeadingNewline = true
+				b.ThinkingBuffer = b.ThinkingBuffer[startPos+len(kiroThinkingStartTag):]
+				if err := b.startThinkingBlock(); err != nil {
+					return err
+				}
+				continue
+			}
+
+			targetLen := len(b.ThinkingBuffer) - len(kiroThinkingStartTag)
+			if targetLen > 0 {
+				safeLen := floorKiroCharBoundary(b.ThinkingBuffer, targetLen)
+				if safeLen > 0 {
+					safeContent := b.ThinkingBuffer[:safeLen]
+					if strings.TrimSpace(safeContent) != "" {
+						if err := b.emitTextDelta(safeContent); err != nil {
+							return err
+						}
+						b.ThinkingBuffer = b.ThinkingBuffer[safeLen:]
+					}
+				}
+			}
+			return nil
+		case b.InThinkingBlock:
+			if b.StripThinkingLeadingNewline {
+				if strings.HasPrefix(b.ThinkingBuffer, "\n") {
+					b.ThinkingBuffer = b.ThinkingBuffer[1:]
+					b.StripThinkingLeadingNewline = false
+				} else if b.ThinkingBuffer != "" {
+					b.StripThinkingLeadingNewline = false
+				}
+			}
+
+			endPos := findKiroThinkingEndTag(b.ThinkingBuffer)
+			if endPos >= 0 {
+				thinkingContent := b.ThinkingBuffer[:endPos]
+				if thinkingContent != "" {
+					if err := b.emitThinkingDelta(thinkingContent); err != nil {
+						return err
+					}
+				}
+				b.InThinkingBlock = false
+				b.ThinkingExtracted = true
+				if err := b.emitThinkingDelta(""); err != nil {
+					return err
+				}
+				if err := b.closeThinkingBlock(); err != nil {
+					return err
+				}
+				b.ThinkingBuffer = b.ThinkingBuffer[endPos+len(kiroThinkingDelimitedEndTag):]
+				continue
+			}
+
+			targetLen := len(b.ThinkingBuffer) - len(kiroThinkingDelimitedEndTag)
+			if targetLen > 0 {
+				safeLen := floorKiroCharBoundary(b.ThinkingBuffer, targetLen)
+				if safeLen > 0 {
+					safeContent := b.ThinkingBuffer[:safeLen]
+					if safeContent != "" {
+						if err := b.emitThinkingDelta(safeContent); err != nil {
+							return err
+						}
+						b.ThinkingBuffer = b.ThinkingBuffer[safeLen:]
+					}
+				}
+			}
+			return nil
+		default:
+			if b.ThinkingBuffer != "" {
+				remaining := b.ThinkingBuffer
+				b.ThinkingBuffer = ""
+				if err := b.emitTextDelta(remaining); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+}
+
+func (b *kiroClaudeStreamBuilder) flushThinkingAtBoundary() error {
+	if !b.InThinkingBlock {
+		return nil
+	}
+	endPos := findKiroThinkingEndTagAtBufferEnd(b.ThinkingBuffer)
+	if endPos < 0 {
+		return nil
+	}
+	thinkingContent := b.ThinkingBuffer[:endPos]
+	if thinkingContent != "" {
+		if err := b.emitThinkingDelta(thinkingContent); err != nil {
+			return err
+		}
+	}
+	b.InThinkingBlock = false
+	b.ThinkingExtracted = true
+	if err := b.emitThinkingDelta(""); err != nil {
+		return err
+	}
+	if err := b.closeThinkingBlock(); err != nil {
+		return err
+	}
+	afterPos := endPos + len(kiroThinkingEndTag)
+	remaining := strings.TrimLeftFunc(b.ThinkingBuffer[afterPos:], unicode.IsSpace)
+	b.ThinkingBuffer = ""
+	if remaining != "" {
+		if err := b.emitTextDelta(remaining); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *kiroClaudeStreamBuilder) processToolUse(toolUse *helps.KiroToolUseEvent) error {
+	if toolUse == nil {
+		return nil
+	}
+	setKiroStopReason(&b.StopReason, "tool_use")
+	if err := b.flushThinkingAtBoundary(); err != nil {
+		return err
+	}
+	if !b.InThinkingBlock && !b.ThinkingExtracted && b.ThinkingBuffer != "" {
+		buffered := b.ThinkingBuffer
+		b.ThinkingBuffer = ""
+		if err := b.emitTextDelta(buffered); err != nil {
+			return err
+		}
+	}
+	if err := b.closeTextBlock(); err != nil {
+		return err
+	}
+
+	state, err := b.startToolBlock(toolUse.ToolUseID, toolUse.Name)
+	if err != nil {
+		return err
+	}
+	state.Name = toolUse.Name
+	if toolUse.Input != "" {
+		state.Builder.WriteString(toolUse.Input)
+	}
+	if !toolUse.Stop {
+		return nil
+	}
+
+	raw := state.Builder.String()
+	if strings.TrimSpace(raw) != "" {
+		b.OutputTokens += (len(raw) + 3) / 4
+		if err := b.emitToolDelta(state, raw); err != nil {
+			return err
+		}
+	}
+	return b.closeToolBlock(state)
+}
+
+func (b *kiroClaudeStreamBuilder) finalize() error {
+	if b.ThinkingBuffer != "" {
+		if b.InThinkingBlock {
+			endPos := findKiroThinkingEndTagAtBufferEnd(b.ThinkingBuffer)
+			if endPos >= 0 {
+				thinkingContent := b.ThinkingBuffer[:endPos]
+				if thinkingContent != "" {
+					if err := b.emitThinkingDelta(thinkingContent); err != nil {
+						return err
+					}
+				}
+				b.InThinkingBlock = false
+				b.ThinkingExtracted = true
+				if err := b.emitThinkingDelta(""); err != nil {
+					return err
+				}
+				if err := b.closeThinkingBlock(); err != nil {
+					return err
+				}
+				afterPos := endPos + len(kiroThinkingEndTag)
+				remaining := strings.TrimLeftFunc(b.ThinkingBuffer[afterPos:], unicode.IsSpace)
+				b.ThinkingBuffer = ""
+				if remaining != "" {
+					if err := b.emitTextDelta(remaining); err != nil {
+						return err
+					}
+				}
+			} else {
+				if err := b.emitThinkingDelta(b.ThinkingBuffer); err != nil {
+					return err
+				}
+				b.ThinkingBuffer = ""
+				b.InThinkingBlock = false
+				b.ThinkingExtracted = true
+				if err := b.emitThinkingDelta(""); err != nil {
+					return err
+				}
+				if err := b.closeThinkingBlock(); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := b.emitTextDelta(b.ThinkingBuffer); err != nil {
+				return err
+			}
+			b.ThinkingBuffer = ""
+		}
+	}
+
+	if b.HasThinkingBlock && !b.HasNonThinkingBlocks {
+		setKiroStopReason(&b.StopReason, "max_tokens")
+		if err := b.emitTextDelta(" "); err != nil {
+			return err
+		}
+	}
+
+	if err := b.closeTextBlock(); err != nil {
+		return err
+	}
+	for _, state := range b.PendingTools {
+		if state.Stopped {
+			continue
+		}
+		raw := state.Builder.String()
+		if strings.TrimSpace(raw) != "" {
+			b.OutputTokens += (len(raw) + 3) / 4
+			if err := b.emitToolDelta(state, raw); err != nil {
+				return err
+			}
+		}
+		if err := b.closeToolBlock(state); err != nil {
+			return err
+		}
+	}
+	if err := b.appendEvent("message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   b.StopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]any{
+			"input_tokens":  b.InputTokens,
+			"output_tokens": b.OutputTokens,
+		},
+	}); err != nil {
+		return err
+	}
+	return b.appendEvent("message_stop", map[string]any{
+		"type": "message_stop",
+	})
+}
+
+func buildClaudeStreamEvents(model string, events []helps.KiroEvent) ([]claudeStreamEvent, error) {
+	inputTokens := kiroInputTokensFromEvents(model, events)
+	builder := newKiroClaudeStreamBuilder(model, inputTokens)
+	messageID := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if err := builder.appendEvent("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
 			"id":            messageID,
@@ -1115,177 +2086,38 @@ func buildClaudeStreamEvents(model string, events []helps.KiroEvent) ([]claudeSt
 			"stop_sequence": nil,
 			"content":       []any{},
 			"usage": map[string]any{
-				"input_tokens":  0,
-				"output_tokens": 0,
+				"input_tokens":  inputTokens,
+				"output_tokens": 1,
 			},
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
-	}
-	streamEvents = append(streamEvents, claudeStreamEvent{Name: "message_start", Data: messageStart})
-
-	openTextIndex := -1
-	nextBlockIndex := 0
-	stopReason := "end_turn"
-	type pendingToolBlock struct {
-		Index   int
-		Stopped bool
-	}
-	pendingTools := make(map[string]*pendingToolBlock)
-
-	closeTextBlock := func() error {
-		if openTextIndex < 0 {
-			return nil
-		}
-		stopData, errMarshal := json.Marshal(map[string]any{
-			"type":  "content_block_stop",
-			"index": openTextIndex,
-		})
-		if errMarshal != nil {
-			return errMarshal
-		}
-		streamEvents = append(streamEvents, claudeStreamEvent{Name: "content_block_stop", Data: stopData})
-		openTextIndex = -1
-		return nil
-	}
-	closeToolBlock := func(state *pendingToolBlock) error {
-		if state == nil || state.Stopped {
-			return nil
-		}
-		stopData, errMarshal := json.Marshal(map[string]any{
-			"type":  "content_block_stop",
-			"index": state.Index,
-		})
-		if errMarshal != nil {
-			return errMarshal
-		}
-		streamEvents = append(streamEvents, claudeStreamEvent{Name: "content_block_stop", Data: stopData})
-		state.Stopped = true
-		return nil
 	}
 
 	for _, event := range events {
 		switch event.Type {
 		case helps.KiroEventAssistantResponse:
-			if event.AssistantResponse == nil || event.AssistantResponse.Content == "" {
+			if event.AssistantResponse == nil {
 				continue
 			}
-			if openTextIndex < 0 {
-				openTextIndex = nextBlockIndex
-				nextBlockIndex++
-				startData, errMarshal := json.Marshal(map[string]any{
-					"type":  "content_block_start",
-					"index": openTextIndex,
-					"content_block": map[string]any{
-						"type": "text",
-						"text": "",
-					},
-				})
-				if errMarshal != nil {
-					return nil, errMarshal
-				}
-				streamEvents = append(streamEvents, claudeStreamEvent{Name: "content_block_start", Data: startData})
-			}
-			deltaData, errMarshal := json.Marshal(map[string]any{
-				"type":  "content_block_delta",
-				"index": openTextIndex,
-				"delta": map[string]any{
-					"type": "text_delta",
-					"text": event.AssistantResponse.Content,
-				},
-			})
-			if errMarshal != nil {
-				return nil, errMarshal
-			}
-			streamEvents = append(streamEvents, claudeStreamEvent{Name: "content_block_delta", Data: deltaData})
-		case helps.KiroEventToolUse:
-			if event.ToolUse == nil {
-				continue
-			}
-			setKiroStopReason(&stopReason, "tool_use")
-			if err = closeTextBlock(); err != nil {
+			if err := builder.processAssistantResponse(event.AssistantResponse.Content); err != nil {
 				return nil, err
 			}
-			state, ok := pendingTools[event.ToolUse.ToolUseID]
-			if !ok {
-				state = &pendingToolBlock{Index: nextBlockIndex}
-				nextBlockIndex++
-				pendingTools[event.ToolUse.ToolUseID] = state
-				startData, errMarshal := json.Marshal(map[string]any{
-					"type":  "content_block_start",
-					"index": state.Index,
-					"content_block": map[string]any{
-						"type":  "tool_use",
-						"id":    event.ToolUse.ToolUseID,
-						"name":  event.ToolUse.Name,
-						"input": map[string]any{},
-					},
-				})
-				if errMarshal != nil {
-					return nil, errMarshal
-				}
-				streamEvents = append(streamEvents, claudeStreamEvent{Name: "content_block_start", Data: startData})
-			}
-			if event.ToolUse.Input != "" {
-				deltaData, errMarshal := json.Marshal(map[string]any{
-					"type":  "content_block_delta",
-					"index": state.Index,
-					"delta": map[string]any{
-						"type":         "input_json_delta",
-						"partial_json": event.ToolUse.Input,
-					},
-				})
-				if errMarshal != nil {
-					return nil, errMarshal
-				}
-				streamEvents = append(streamEvents, claudeStreamEvent{Name: "content_block_delta", Data: deltaData})
-			}
-			if event.ToolUse.Stop {
-				if err = closeToolBlock(state); err != nil {
-					return nil, err
-				}
+		case helps.KiroEventToolUse:
+			if err := builder.processToolUse(event.ToolUse); err != nil {
+				return nil, err
 			}
 		case helps.KiroEventContextUsage:
 			if event.ContextUsage != nil && event.ContextUsage.ContextUsagePercentage >= 100 {
-				setKiroStopReason(&stopReason, "model_context_window_exceeded")
+				setKiroStopReason(&builder.StopReason, "model_context_window_exceeded")
 			}
 		}
 	}
 
-	if err = closeTextBlock(); err != nil {
+	if err := builder.finalize(); err != nil {
 		return nil, err
 	}
-	for _, state := range pendingTools {
-		if err = closeToolBlock(state); err != nil {
-			return nil, err
-		}
-	}
-
-	messageDelta, err := json.Marshal(map[string]any{
-		"type": "message_delta",
-		"delta": map[string]any{
-			"stop_reason":   stopReason,
-			"stop_sequence": nil,
-		},
-		"usage": map[string]any{
-			"input_tokens":  0,
-			"output_tokens": 0,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	streamEvents = append(streamEvents, claudeStreamEvent{Name: "message_delta", Data: messageDelta})
-
-	messageStop, err := json.Marshal(map[string]any{
-		"type": "message_stop",
-	})
-	if err != nil {
-		return nil, err
-	}
-	streamEvents = append(streamEvents, claudeStreamEvent{Name: "message_stop", Data: messageStop})
-	return streamEvents, nil
+	return builder.Events, nil
 }
 
 func normalizeJSON(raw string) string {
