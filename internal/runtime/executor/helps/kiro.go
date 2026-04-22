@@ -361,14 +361,20 @@ func prepareKiroBalanceAuth(ctx context.Context, cfg *config.Config, auth *clipr
 		targetAuth = updatedAuth
 	}
 	creds := KiroCredentialsFromAuth(targetAuth)
-
-	// Force one upstream profile probe before reading balance so suspended
-	// accounts are surfaced even when getUsageLimits still returns 200.
-	if _, errProbe := listKiroAvailableProfiles(ctx, cfg, targetAuth, creds, token); errProbe != nil {
-		return targetAuth, "", creds, errProbe
+	resolvedCreds, err := resolveKiroProfileContext(ctx, cfg, targetAuth, creds, token)
+	if err != nil {
+		return targetAuth, "", creds, err
+	}
+	if targetAuth != nil {
+		ApplyKiroCredentialsToAuth(targetAuth, resolvedCreds)
+	}
+	// Probe the same upstream endpoint used by model catalog refresh so
+	// TEMPORARILY_SUSPENDED accounts are surfaced before getUsageLimits.
+	if _, err = listKiroAvailableModels(ctx, cfg, targetAuth, resolvedCreds, token); err != nil {
+		return targetAuth, "", resolvedCreds, err
 	}
 
-	return targetAuth, token, creds, nil
+	return targetAuth, token, resolvedCreds, nil
 }
 
 func fetchKiroBalanceWithToken(ctx context.Context, cfg *config.Config, targetAuth *cliproxyauth.Auth, creds KiroCredentials, token string) (KiroBalance, *cliproxyauth.Auth, error) {

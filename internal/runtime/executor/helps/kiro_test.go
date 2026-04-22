@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"testing"
+	"time"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestResolveKiroProfileContextUsesFixedBuilderProfile(t *testing.T) {
@@ -35,6 +38,51 @@ func TestResolveKiroProfileContextUsesFixedBuilderProfile(t *testing.T) {
 	}
 	if resolved.ProfileARN != kiroBuilderIDProfileARN {
 		t.Fatalf("expected fixed builder profile ARN, got %q", resolved.ProfileARN)
+	}
+}
+
+func TestApplyKiroResolvedBuilderProfileToAuth(t *testing.T) {
+	t.Parallel()
+
+	serialized, err := json.Marshal(kiroClientSecretSerialized{
+		InitiateLoginURI: kiroBuilderIDStartURL + "/",
+	})
+	if err != nil {
+		t.Fatalf("marshal serialized client secret: %v", err)
+	}
+	payload, err := json.Marshal(kiroClientSecretPayload{
+		Serialized: string(serialized),
+	})
+	if err != nil {
+		t.Fatalf("marshal client secret payload: %v", err)
+	}
+	clientSecret := "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+
+	auth := &cliproxyauth.Auth{}
+	ApplyKiroCredentialsToAuth(auth, KiroCredentials{
+		AccessToken:  "token",
+		ExpiresAt:    time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339),
+		ClientSecret: clientSecret,
+	})
+
+	resolved, err := resolveKiroProfileContext(context.Background(), nil, nil, KiroCredentials{
+		ClientSecret: clientSecret,
+	}, "token")
+	if err != nil {
+		t.Fatalf("resolve profile context: %v", err)
+	}
+
+	ApplyKiroCredentialsToAuth(auth, resolved)
+
+	gotCreds := KiroCredentialsFromAuth(auth)
+	if gotCreds.Provider != "BuilderId" {
+		t.Fatalf("expected provider BuilderId, got %q", gotCreds.Provider)
+	}
+	if gotCreds.ProfileARN != kiroBuilderIDProfileARN {
+		t.Fatalf("expected fixed builder profile ARN, got %q", gotCreds.ProfileARN)
+	}
+	if got := KiroCredentialsFromAuth(auth).ProfileARN; got != kiroBuilderIDProfileARN {
+		t.Fatalf("expected auth metadata profile ARN %q, got %q", kiroBuilderIDProfileARN, got)
 	}
 }
 
