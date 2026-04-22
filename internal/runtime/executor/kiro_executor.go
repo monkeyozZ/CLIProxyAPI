@@ -2117,7 +2117,59 @@ func buildClaudeStreamEvents(model string, events []helps.KiroEvent) ([]claudeSt
 	if err := builder.finalize(); err != nil {
 		return nil, err
 	}
-	return builder.Events, nil
+	return normalizeClaudeStreamEventIndices(builder.Events)
+}
+
+func normalizeClaudeStreamEventIndices(events []claudeStreamEvent) ([]claudeStreamEvent, error) {
+	if len(events) == 0 {
+		return events, nil
+	}
+
+	indexMap := make(map[int]int, 8)
+	nextIndex := 0
+	normalized := make([]claudeStreamEvent, 0, len(events))
+
+	for _, event := range events {
+		eventType := gjson.GetBytes(event.Data, "type").String()
+		switch eventType {
+		case "content_block_start":
+			originalIndex := int(gjson.GetBytes(event.Data, "index").Int())
+			mappedIndex, ok := indexMap[originalIndex]
+			if !ok {
+				mappedIndex = nextIndex
+				nextIndex++
+				indexMap[originalIndex] = mappedIndex
+			}
+			if mappedIndex == originalIndex {
+				normalized = append(normalized, event)
+				continue
+			}
+			updated, err := sjson.SetBytes(event.Data, "index", mappedIndex)
+			if err != nil {
+				return nil, err
+			}
+			normalized = append(normalized, claudeStreamEvent{Name: event.Name, Data: updated})
+		case "content_block_delta", "content_block_stop":
+			originalIndex := int(gjson.GetBytes(event.Data, "index").Int())
+			mappedIndex, ok := indexMap[originalIndex]
+			if !ok {
+				continue
+			}
+			if mappedIndex == originalIndex {
+				normalized = append(normalized, event)
+				continue
+			}
+			updated, err := sjson.SetBytes(event.Data, "index", mappedIndex)
+			if err != nil {
+				return nil, err
+			}
+			normalized = append(normalized, claudeStreamEvent{Name: event.Name, Data: updated})
+		default:
+			normalized = append(normalized, event)
+		}
+	}
+
+	return normalized, nil
 }
 
 func normalizeJSON(raw string) string {

@@ -810,6 +810,152 @@ func TestBuildClaudeStreamEventsEmitThinkingBlocks(t *testing.T) {
 	}
 }
 
+func TestNormalizeClaudeStreamEventIndicesDropsOrphansAndRenumbersVisibleBlocks(t *testing.T) {
+	t.Parallel()
+
+	events := []claudeStreamEvent{
+		{
+			Name: "message_start",
+			Data: []byte(`{"type":"message_start","message":{"content":[]}}`),
+		},
+		{
+			Name: "content_block_start",
+			Data: []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		},
+		{
+			Name: "content_block_delta",
+			Data: []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`),
+		},
+		{
+			Name: "content_block_stop",
+			Data: []byte(`{"type":"content_block_stop","index":0}`),
+		},
+		{
+			Name: "content_block_start",
+			Data: []byte(`{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}`),
+		},
+		{
+			Name: "content_block_delta",
+			Data: []byte(`{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/tmp/a\"}"}}`),
+		},
+		{
+			Name: "content_block_start",
+			Data: []byte(`{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_2","name":"Bash","input":{}}}`),
+		},
+		{
+			Name: "content_block_delta",
+			Data: []byte(`{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}`),
+		},
+		{
+			Name: "content_block_start",
+			Data: []byte(`{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_3","name":"ToolSearch","input":{}}}`),
+		},
+		{
+			Name: "content_block_delta",
+			Data: []byte(`{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"select:Read\"}"}}`),
+		},
+		{
+			Name: "content_block_stop",
+			Data: []byte(`{"type":"content_block_stop","index":1}`),
+		},
+		{
+			Name: "content_block_stop",
+			Data: []byte(`{"type":"content_block_stop","index":2}`),
+		},
+		{
+			Name: "content_block_stop",
+			Data: []byte(`{"type":"content_block_stop","index":3}`),
+		},
+		{
+			Name: "content_block_stop",
+			Data: []byte(`{"type":"content_block_stop","index":4}`),
+		},
+		{
+			Name: "message_delta",
+			Data: []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`),
+		},
+		{
+			Name: "message_stop",
+			Data: []byte(`{"type":"message_stop"}`),
+		},
+	}
+
+	normalized, err := normalizeClaudeStreamEventIndices(events)
+	if err != nil {
+		t.Fatalf("normalizeClaudeStreamEventIndices: %v", err)
+	}
+
+	type contentBlockStart struct {
+		Index        int `json:"index"`
+		ContentBlock struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"content_block"`
+	}
+	type contentBlockDelta struct {
+		Index int `json:"index"`
+		Delta struct {
+			Type string `json:"type"`
+		} `json:"delta"`
+	}
+	type contentBlockStop struct {
+		Index int `json:"index"`
+	}
+
+	var starts []contentBlockStart
+	var deltas []contentBlockDelta
+	var stops []contentBlockStop
+	for _, event := range normalized {
+		switch event.Name {
+		case "content_block_start":
+			var decoded contentBlockStart
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal content_block_start: %v", err)
+			}
+			starts = append(starts, decoded)
+		case "content_block_delta":
+			var decoded contentBlockDelta
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal content_block_delta: %v", err)
+			}
+			deltas = append(deltas, decoded)
+		case "content_block_stop":
+			var decoded contentBlockStop
+			if err := json.Unmarshal(event.Data, &decoded); err != nil {
+				t.Fatalf("unmarshal content_block_stop: %v", err)
+			}
+			stops = append(stops, decoded)
+		}
+	}
+
+	if len(starts) != 4 {
+		t.Fatalf("expected 4 visible content_block_start events, got %d", len(starts))
+	}
+	for i, start := range starts {
+		if start.Index != i {
+			t.Fatalf("expected start index %d, got %d", i, start.Index)
+		}
+	}
+
+	if len(stops) != 4 {
+		t.Fatalf("expected 4 content_block_stop events after dropping orphan, got %d", len(stops))
+	}
+	for i, stop := range stops {
+		if stop.Index != i {
+			t.Fatalf("expected stop index %d, got %d", i, stop.Index)
+		}
+	}
+
+	if len(deltas) != 4 {
+		t.Fatalf("expected 4 content_block_delta events, got %d", len(deltas))
+	}
+	for i, delta := range deltas {
+		if delta.Index != i {
+			t.Fatalf("expected delta index %d, got %d", i, delta.Index)
+		}
+	}
+}
+
 func TestBuildClaudeStreamEventsUsesContextUsageTokens(t *testing.T) {
 	t.Parallel()
 
