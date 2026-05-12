@@ -176,6 +176,7 @@ var kiroDirectModels = map[string]string{
 	"claude-sonnet-4.6": "claude-sonnet-4.6",
 	"claude-sonnet-4.5": "claude-sonnet-4.5",
 	"claude-sonnet-4":   "claude-sonnet-4",
+	"claude-opus-4.7":   "claude-opus-4.7",
 	"claude-opus-4.6":   "claude-opus-4.6",
 	"claude-opus-4.5":   "claude-opus-4.5",
 	"claude-haiku-4.5":  "claude-haiku-4.5",
@@ -480,6 +481,9 @@ func KiroMapModel(model string) (string, bool) {
 			return "claude-sonnet-4", true
 		}
 	case strings.Contains(model, "opus"):
+		if strings.Contains(model, "4-7") || strings.Contains(model, "4.7") {
+			return "claude-opus-4.7", true
+		}
 		if strings.Contains(model, "4-5") || strings.Contains(model, "4.5") {
 			return "claude-opus-4.5", true
 		}
