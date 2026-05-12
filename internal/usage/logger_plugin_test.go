@@ -3,6 +3,8 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -44,6 +46,90 @@ func TestRequestStatisticsRecordBuildsEndpointSnapshot(t *testing.T) {
 	}
 	if detail.Tokens.CacheReadTokens != 3 || detail.Tokens.CacheCreationTokens != 4 {
 		t.Fatalf("cache breakdown = %+v", detail.Tokens)
+	}
+}
+
+func TestRequestStatisticsPersistsEventsInSQLite(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	stats := NewRequestStatistics()
+	if err := stats.ConfigureStorage(configPath); err != nil {
+		t.Fatalf("ConfigureStorage: %v", err)
+	}
+	stats.Record(context.Background(), coreusage.Record{
+		Provider:    "kiro",
+		Model:       "claude-opus-4.7",
+		Source:      "user@example.com",
+		AuthIndex:   "kiro.json#1",
+		RequestedAt: time.Date(2026, 5, 12, 8, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 5,
+		},
+	})
+
+	reloaded := NewRequestStatistics()
+	if err := reloaded.ConfigureStorage(configPath); err != nil {
+		t.Fatalf("ConfigureStorage reload: %v", err)
+	}
+	snapshot := reloaded.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("reloaded total requests = %d, want 1", snapshot.TotalRequests)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "usage", "usage.sqlite")); err != nil {
+		t.Fatalf("usage sqlite not created: %v", err)
+	}
+	status, err := reloaded.ServiceStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ServiceStatus: %v", err)
+	}
+	if status.Service != "cpa-manager" || status.Events != 1 || status.Collector.TotalInserted != 1 {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+	if status.Collector.Collector != "running" || status.Collector.Mode != "embedded" || status.Collector.Transport != "plugin" {
+		t.Fatalf("unexpected collector status: %+v", status.Collector)
+	}
+	if status.Collector.LastConsumedAt == 0 || status.Collector.LastInsertedAt == 0 {
+		t.Fatalf("status missing event timestamps: %+v", status.Collector)
+	}
+}
+
+func TestRequestStatisticsMigratesLegacyJSONLToSQLite(t *testing.T) {
+	dir := t.TempDir()
+	usageDir := filepath.Join(dir, "usage")
+	if err := os.MkdirAll(usageDir, 0o755); err != nil {
+		t.Fatalf("mkdir usage dir: %v", err)
+	}
+	event := normalizeEvent(Event{
+		TimestampMS: time.Date(2026, 5, 12, 8, 0, 0, 0, time.UTC).UnixMilli(),
+		Model:       "glm-5",
+		Endpoint:    "POST /v1/chat/completions",
+		InputTokens: 1,
+		TotalTokens: 1,
+	})
+	line, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(usageDir, "usage-events.jsonl"), append(line, '\n'), 0o600); err != nil {
+		t.Fatalf("write legacy jsonl: %v", err)
+	}
+
+	stats := NewRequestStatistics()
+	if err := stats.ConfigureStorage(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("ConfigureStorage: %v", err)
+	}
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("migrated total requests = %d, want 1", snapshot.TotalRequests)
+	}
+	exported, err := stats.ExportJSONL()
+	if err != nil {
+		t.Fatalf("ExportJSONL: %v", err)
+	}
+	if len(exported) == 0 {
+		t.Fatal("ExportJSONL returned empty data")
 	}
 }
 

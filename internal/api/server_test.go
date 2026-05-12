@@ -85,7 +85,7 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
-func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
+func TestManagementUsageRequiresManagementAuthAndQueuePopsArray(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
 	prevQueueEnabled := redisqueue.Enabled()
@@ -107,12 +107,18 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
-	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
-	legacyRR := httptest.NewRecorder()
-	server.engine.ServeHTTP(legacyRR, legacyReq)
-	if legacyRR.Code != http.StatusNotFound {
-		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	usageReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
+	usageReq.Header.Set("Authorization", "Bearer test-management-key")
+	usageRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(usageRR, usageReq)
+	if usageRR.Code != http.StatusOK {
+		t.Fatalf("usage status = %d, want %d body=%s", usageRR.Code, http.StatusOK, usageRR.Body.String())
+	}
+	var snapshot struct {
+		TotalRequests int64 `json:"total_requests"`
+	}
+	if errUnmarshal := json.Unmarshal(usageRR.Body.Bytes(), &snapshot); errUnmarshal != nil {
+		t.Fatalf("unmarshal usage snapshot: %v body=%s", errUnmarshal, usageRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)

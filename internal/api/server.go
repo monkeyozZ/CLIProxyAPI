@@ -376,13 +376,28 @@ func (s *Server) setupRoutes() {
 	}
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
+	s.engine.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "service": "cpa-manager"})
+	})
+	s.engine.HEAD("/health", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	s.engine.GET("/usage-service/info", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"service": "cpa-manager",
-			"mode":    "embedded",
+			"service":   "cpa-manager",
+			"mode":      "embedded",
+			"startedAt": usage.StartedAtMS(),
 		})
+	})
+	s.engine.GET("/status", s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), func(c *gin.Context) {
+		status, err := usage.GetServiceStatus(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, status)
 	})
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)

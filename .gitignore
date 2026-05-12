@@ -9,6 +9,7 @@ config.yaml
 # Generated content
 bin/*
 logs/*
+usage/*
 conv/*
 temp/*
 refs/*

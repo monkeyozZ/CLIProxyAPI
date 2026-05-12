@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,6 +40,7 @@ const (
 var (
 	statisticsEnabled atomic.Bool
 	endpointPattern   = regexp.MustCompile(`^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+(\S+)`)
+	startedAtMS       = time.Now().UnixMilli()
 )
 
 func init() {
@@ -70,6 +70,9 @@ func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
 // StatisticsEnabled reports the current recording state.
 func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 
+// StartedAtMS returns the embedded usage service start timestamp in milliseconds.
+func StartedAtMS() int64 { return startedAtMS }
+
 // TokenStats captures the token usage breakdown for a request.
 type TokenStats struct {
 	InputTokens         int64 `json:"input_tokens"`
@@ -84,12 +87,17 @@ type TokenStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms,omitempty"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp            time.Time  `json:"timestamp"`
+	LatencyMs            int64      `json:"latency_ms,omitempty"`
+	Source               string     `json:"source"`
+	AuthIndex            string     `json:"auth_index"`
+	AccountSnapshot      string     `json:"account_snapshot,omitempty"`
+	AuthLabelSnapshot    string     `json:"auth_label_snapshot,omitempty"`
+	AuthFileSnapshot     string     `json:"auth_file_snapshot,omitempty"`
+	AuthProviderSnapshot string     `json:"auth_provider_snapshot,omitempty"`
+	AuthSnapshotAtMS     int64      `json:"auth_snapshot_at_ms,omitempty"`
+	Tokens               TokenStats `json:"tokens"`
+	Failed               bool       `json:"failed"`
 }
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
@@ -135,32 +143,37 @@ type modelStats struct {
 
 // Event is the persisted usage-service-compatible event format.
 type Event struct {
-	RequestID           string `json:"request_id,omitempty"`
-	EventHash           string `json:"event_hash"`
-	TimestampMS         int64  `json:"timestamp_ms"`
-	Timestamp           string `json:"timestamp"`
-	Provider            string `json:"provider,omitempty"`
-	Model               string `json:"model"`
-	Endpoint            string `json:"endpoint,omitempty"`
-	Method              string `json:"method,omitempty"`
-	Path                string `json:"path,omitempty"`
-	AuthType            string `json:"auth_type,omitempty"`
-	AuthIndex           string `json:"auth_index,omitempty"`
-	Source              string `json:"source,omitempty"`
-	SourceHash          string `json:"source_hash,omitempty"`
-	APIKeyHash          string `json:"api_key_hash,omitempty"`
-	InputTokens         int64  `json:"input_tokens"`
-	OutputTokens        int64  `json:"output_tokens"`
-	ReasoningTokens     int64  `json:"reasoning_tokens"`
-	CachedTokens        int64  `json:"cached_tokens"`
-	CacheReadTokens     int64  `json:"cache_read_tokens,omitempty"`
-	CacheCreationTokens int64  `json:"cache_creation_tokens,omitempty"`
-	CacheTokens         int64  `json:"cache_tokens"`
-	TotalTokens         int64  `json:"total_tokens"`
-	LatencyMS           *int64 `json:"latency_ms,omitempty"`
-	Failed              bool   `json:"failed"`
-	RawJSON             string `json:"raw_json,omitempty"`
-	CreatedAtMS         int64  `json:"created_at_ms"`
+	RequestID            string `json:"request_id,omitempty"`
+	EventHash            string `json:"event_hash"`
+	TimestampMS          int64  `json:"timestamp_ms"`
+	Timestamp            string `json:"timestamp"`
+	Provider             string `json:"provider,omitempty"`
+	Model                string `json:"model"`
+	Endpoint             string `json:"endpoint,omitempty"`
+	Method               string `json:"method,omitempty"`
+	Path                 string `json:"path,omitempty"`
+	AuthType             string `json:"auth_type,omitempty"`
+	AuthIndex            string `json:"auth_index,omitempty"`
+	Source               string `json:"source,omitempty"`
+	SourceHash           string `json:"source_hash,omitempty"`
+	APIKeyHash           string `json:"api_key_hash,omitempty"`
+	AccountSnapshot      string `json:"account_snapshot,omitempty"`
+	AuthLabelSnapshot    string `json:"auth_label_snapshot,omitempty"`
+	AuthFileSnapshot     string `json:"auth_file_snapshot,omitempty"`
+	AuthProviderSnapshot string `json:"auth_provider_snapshot,omitempty"`
+	AuthSnapshotAtMS     int64  `json:"auth_snapshot_at_ms,omitempty"`
+	InputTokens          int64  `json:"input_tokens"`
+	OutputTokens         int64  `json:"output_tokens"`
+	ReasoningTokens      int64  `json:"reasoning_tokens"`
+	CachedTokens         int64  `json:"cached_tokens"`
+	CacheReadTokens      int64  `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens  int64  `json:"cache_creation_tokens,omitempty"`
+	CacheTokens          int64  `json:"cache_tokens"`
+	TotalTokens          int64  `json:"total_tokens"`
+	LatencyMS            *int64 `json:"latency_ms,omitempty"`
+	Failed               bool   `json:"failed"`
+	RawJSON              string `json:"raw_json,omitempty"`
+	CreatedAtMS          int64  `json:"created_at_ms"`
 }
 
 // MergeResult summarises import results.
@@ -203,6 +216,30 @@ type ModelPriceSyncResult struct {
 	Source   string                `json:"source,omitempty"`
 }
 
+// CollectorStatus mirrors CPA-Manager usage service collector status fields.
+type CollectorStatus struct {
+	Collector      string `json:"collector"`
+	Upstream       string `json:"upstream"`
+	Mode           string `json:"mode"`
+	Transport      string `json:"transport"`
+	Queue          string `json:"queue"`
+	LastConsumedAt int64  `json:"lastConsumedAt"`
+	LastInsertedAt int64  `json:"lastInsertedAt"`
+	TotalInserted  int64  `json:"totalInserted"`
+	TotalSkipped   int64  `json:"totalSkipped"`
+	DeadLetters    int64  `json:"deadLetters"`
+	LastError      string `json:"lastError,omitempty"`
+}
+
+// ServiceStatus mirrors CPA-Manager usage service status fields.
+type ServiceStatus struct {
+	Service     string          `json:"service"`
+	DBPath      string          `json:"dbPath"`
+	Events      int64           `json:"events"`
+	DeadLetters int64           `json:"deadLetters"`
+	Collector   CollectorStatus `json:"collector"`
+}
+
 // RequestStatistics maintains aggregated request metrics in memory and on disk.
 type RequestStatistics struct {
 	mu sync.RWMutex
@@ -219,17 +256,25 @@ type RequestStatistics struct {
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
 	eventHashes    map[string]struct{}
+	skippedEvents  int64
 
-	storageDir      string
-	eventsPath      string
-	modelPricesPath string
-	modelPrices     map[string]ModelPrice
+	storageDir            string
+	dbPath                string
+	legacyEventsPath      string
+	legacyModelPricesPath string
+	store                 *sqliteUsageStore
+	modelPrices           map[string]ModelPrice
 }
 
 var defaultRequestStatistics = NewRequestStatistics()
 
 // GetRequestStatistics returns the shared statistics store.
 func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics }
+
+// GetServiceStatus returns the embedded usage service status.
+func GetServiceStatus(ctx context.Context) (ServiceStatus, error) {
+	return defaultRequestStatistics.ServiceStatus(ctx)
+}
 
 // NewRequestStatistics constructs an empty statistics store.
 func NewRequestStatistics() *RequestStatistics {
@@ -262,26 +307,61 @@ func (s *RequestStatistics) ConfigureStorage(configFilePath string) error {
 		return fmt.Errorf("usage storage mkdir: %w", err)
 	}
 
-	eventsPath := filepath.Join(dir, "usage-events.jsonl")
-	modelPricesPath := filepath.Join(dir, "model-prices.json")
+	dbPath := filepath.Join(dir, "usage.sqlite")
+	legacyEventsPath := filepath.Join(dir, "usage-events.jsonl")
+	legacyModelPricesPath := filepath.Join(dir, "model-prices.json")
+	store, err := openSQLiteUsageStore(dbPath)
+	if err != nil {
+		return fmt.Errorf("usage sqlite open: %w", err)
+	}
 
 	s.mu.Lock()
-	if s.storageDir == dir {
+	if s.dbPath == dbPath && s.store != nil {
 		s.mu.Unlock()
+		_ = store.Close()
 		return nil
 	}
+	oldStore := s.store
+	s.resetAggregatesLocked()
 	s.storageDir = dir
-	s.eventsPath = eventsPath
-	s.modelPricesPath = modelPricesPath
+	s.dbPath = dbPath
+	s.legacyEventsPath = legacyEventsPath
+	s.legacyModelPricesPath = legacyModelPricesPath
+	s.store = store
 	s.mu.Unlock()
 
-	if err := s.loadEvents(eventsPath); err != nil {
+	if oldStore != nil {
+		_ = oldStore.Close()
+	}
+
+	if err := s.migrateLegacyEvents(legacyEventsPath); err != nil {
 		return err
 	}
-	if err := s.loadModelPrices(modelPricesPath); err != nil {
+	if err := s.migrateLegacyModelPrices(legacyModelPricesPath); err != nil {
+		return err
+	}
+	if err := s.loadEventsFromStore(context.Background()); err != nil {
+		return err
+	}
+	if err := s.loadModelPricesFromStore(context.Background()); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *RequestStatistics) resetAggregatesLocked() {
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+	s.apis = make(map[string]*apiStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+	s.eventHashes = make(map[string]struct{})
+	s.skippedEvents = 0
+	s.modelPrices = make(map[string]ModelPrice)
 }
 
 func resolveStorageDir(configFilePath string) string {
@@ -303,10 +383,12 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if s == nil || !statisticsEnabled.Load() {
 		return
 	}
-	event := eventFromUsageRecord(ctx, record)
+	event := normalizeEvent(eventFromUsageRecord(ctx, record))
 	inserted := s.insertEvent(event)
 	if inserted {
-		_ = s.appendEvent(event)
+		_ = s.persistEvent(ctx, event)
+	} else {
+		s.addSkipped(1)
 	}
 }
 
@@ -374,12 +456,20 @@ func eventFromUsageRecord(ctx context.Context, record coreusage.Record) Event {
 	return event
 }
 
-func (s *RequestStatistics) insertEvent(event Event) bool {
-	if event.EventHash == "" {
-		event.EventHash = buildEventHash(event)
+func normalizeEvent(event Event) Event {
+	if event.Timestamp == "" && event.TimestampMS > 0 {
+		event.Timestamp = time.UnixMilli(event.TimestampMS).UTC().Format(time.RFC3339Nano)
 	}
-	if event.EventHash == "" {
-		return false
+	if event.TimestampMS <= 0 {
+		if event.Timestamp != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, event.Timestamp); err == nil {
+				event.TimestampMS = parsed.UnixMilli()
+			}
+		}
+		if event.TimestampMS <= 0 {
+			event.TimestampMS = time.Now().UnixMilli()
+			event.Timestamp = time.UnixMilli(event.TimestampMS).UTC().Format(time.RFC3339Nano)
+		}
 	}
 	if event.Timestamp == "" {
 		event.Timestamp = time.UnixMilli(event.TimestampMS).UTC().Format(time.RFC3339Nano)
@@ -387,8 +477,6 @@ func (s *RequestStatistics) insertEvent(event Event) bool {
 	if event.TimestampMS <= 0 {
 		if parsed, err := time.Parse(time.RFC3339Nano, event.Timestamp); err == nil {
 			event.TimestampMS = parsed.UnixMilli()
-		} else {
-			event.TimestampMS = time.Now().UnixMilli()
 		}
 	}
 	if event.Model == "" {
@@ -397,8 +485,41 @@ func (s *RequestStatistics) insertEvent(event Event) bool {
 	if event.Endpoint == "" {
 		event.Endpoint = "-"
 	}
+	if event.Method == "" || event.Path == "" {
+		if method, path := parseEndpoint(event.Endpoint); method != "" {
+			if event.Method == "" {
+				event.Method = method
+			}
+			if event.Path == "" {
+				event.Path = path
+			}
+		}
+	}
+	if event.CacheTokens == 0 {
+		event.CacheTokens = event.CacheReadTokens + event.CacheCreationTokens
+	}
+	if event.CacheTokens == 0 {
+		event.CacheTokens = event.CachedTokens
+	}
+	if event.TotalTokens <= 0 {
+		event.TotalTokens = event.InputTokens + event.OutputTokens + event.ReasoningTokens
+	}
 	if event.TotalTokens <= 0 {
 		event.TotalTokens = event.InputTokens + event.OutputTokens + event.ReasoningTokens + maxInt64(event.CachedTokens, event.CacheTokens)
+	}
+	if event.CreatedAtMS <= 0 {
+		event.CreatedAtMS = time.Now().UnixMilli()
+	}
+	if event.EventHash == "" {
+		event.EventHash = buildEventHash(event)
+	}
+	return event
+}
+
+func (s *RequestStatistics) insertEvent(event Event) bool {
+	event = normalizeEvent(event)
+	if event.EventHash == "" {
+		return false
 	}
 
 	timestamp := time.UnixMilli(event.TimestampMS)
@@ -413,11 +534,16 @@ func (s *RequestStatistics) insertEvent(event Event) bool {
 		TotalTokens:         event.TotalTokens,
 	}
 	detail := RequestDetail{
-		Timestamp: timestamp,
-		Source:    event.Source,
-		AuthIndex: event.AuthIndex,
-		Tokens:    tokens,
-		Failed:    event.Failed,
+		Timestamp:            timestamp,
+		Source:               event.Source,
+		AuthIndex:            event.AuthIndex,
+		AccountSnapshot:      event.AccountSnapshot,
+		AuthLabelSnapshot:    event.AuthLabelSnapshot,
+		AuthFileSnapshot:     event.AuthFileSnapshot,
+		AuthProviderSnapshot: event.AuthProviderSnapshot,
+		AuthSnapshotAtMS:     event.AuthSnapshotAtMS,
+		Tokens:               tokens,
+		Failed:               event.Failed,
 	}
 	if event.LatencyMS != nil && *event.LatencyMS > 0 {
 		detail.LatencyMs = *event.LatencyMS
@@ -518,6 +644,52 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	return result
 }
 
+// ServiceStatus returns SQLite-backed usage service health information.
+func (s *RequestStatistics) ServiceStatus(ctx context.Context) (ServiceStatus, error) {
+	collector := CollectorStatus{
+		Collector: "running",
+		Upstream:  "internal",
+		Mode:      "embedded",
+		Transport: "plugin",
+		Queue:     "internal",
+	}
+	if !statisticsEnabled.Load() {
+		collector.Collector = "stopped"
+	}
+	status := ServiceStatus{
+		Service:   "cpa-manager",
+		Collector: collector,
+	}
+	if s == nil {
+		return status, nil
+	}
+
+	s.mu.RLock()
+	status.DBPath = s.dbPath
+	store := s.store
+	status.Collector.TotalSkipped = s.skippedEvents
+	s.mu.RUnlock()
+
+	if store == nil {
+		return status, nil
+	}
+	events, deadLetters, err := store.Counts(ctx)
+	if err != nil {
+		return status, err
+	}
+	status.Events = events
+	status.DeadLetters = deadLetters
+	status.Collector.DeadLetters = deadLetters
+	status.Collector.TotalInserted = events
+	lastConsumedAt, lastInsertedAt, err := store.LatestEventTimes(ctx)
+	if err != nil {
+		return status, err
+	}
+	status.Collector.LastConsumedAt = lastConsumedAt
+	status.Collector.LastInsertedAt = lastInsertedAt
+	return status, nil
+}
+
 // ImportEvents merges events into the current store and appends new events to disk.
 func (s *RequestStatistics) ImportEvents(parsed ImportParseResult) MergeResult {
 	result := MergeResult{
@@ -531,17 +703,28 @@ func (s *RequestStatistics) ImportEvents(parsed ImportParseResult) MergeResult {
 		return result
 	}
 	for _, event := range parsed.Events {
+		event = normalizeEvent(event)
 		if s.insertEvent(event) {
 			result.Added++
-			_ = s.appendEvent(event)
+			_ = s.persistEvent(context.Background(), event)
 		} else {
 			result.Skipped++
+			s.addSkipped(1)
 		}
 	}
 	return result
 }
 
-func (s *RequestStatistics) loadEvents(path string) error {
+func (s *RequestStatistics) addSkipped(count int64) {
+	if s == nil || count <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.skippedEvents += count
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) migrateLegacyEvents(path string) error {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -560,9 +743,15 @@ func (s *RequestStatistics) loadEvents(path string) error {
 		}
 		var event Event
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			s.addDeadLetter(context.Background(), line, err)
 			continue
 		}
-		s.insertEvent(event)
+		event = normalizeEvent(event)
+		if store := s.currentStore(); store != nil {
+			if _, err := store.InsertEvents(context.Background(), []Event{event}); err != nil {
+				return fmt.Errorf("usage sqlite migrate events: %w", err)
+			}
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("usage storage scan events: %w", err)
@@ -570,29 +759,43 @@ func (s *RequestStatistics) loadEvents(path string) error {
 	return nil
 }
 
-func (s *RequestStatistics) appendEvent(event Event) error {
-	s.mu.RLock()
-	path := s.eventsPath
-	s.mu.RUnlock()
-	if path == "" {
+func (s *RequestStatistics) loadEventsFromStore(ctx context.Context) error {
+	store := s.currentStore()
+	if store == nil {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := json.Marshal(event)
+	events, err := store.Events(ctx, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("usage sqlite load events: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		return err
+	for _, event := range events {
+		s.insertEvent(event)
 	}
 	return nil
+}
+
+func (s *RequestStatistics) currentStore() *sqliteUsageStore {
+	s.mu.RLock()
+	store := s.store
+	s.mu.RUnlock()
+	return store
+}
+
+func (s *RequestStatistics) persistEvent(ctx context.Context, event Event) error {
+	store := s.currentStore()
+	if store == nil {
+		return nil
+	}
+	_, err := store.InsertEvents(ctx, []Event{event})
+	return err
+}
+
+func (s *RequestStatistics) addDeadLetter(ctx context.Context, payload string, err error) {
+	store := s.currentStore()
+	if store == nil {
+		return
+	}
+	_ = store.AddDeadLetter(ctx, payload, err)
 }
 
 // ExportJSONL returns persisted usage events as newline-delimited JSON.
@@ -600,14 +803,8 @@ func (s *RequestStatistics) ExportJSONL() ([]byte, error) {
 	if s == nil {
 		return nil, nil
 	}
-	s.mu.RLock()
-	path := s.eventsPath
-	s.mu.RUnlock()
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err == nil || !errors.Is(err, os.ErrNotExist) {
-			return data, err
-		}
+	if store := s.currentStore(); store != nil {
+		return store.ExportJSONL(context.Background())
 	}
 	return eventsFromSnapshot(s.Snapshot())
 }
@@ -641,26 +838,31 @@ func eventFromDetail(endpoint, method, path, model string, detail RequestDetail)
 		latency = &detail.LatencyMs
 	}
 	event := Event{
-		TimestampMS:         timestamp.UnixMilli(),
-		Timestamp:           timestamp.UTC().Format(time.RFC3339Nano),
-		Model:               nonEmpty(model, "unknown"),
-		Endpoint:            nonEmpty(endpoint, "-"),
-		Method:              method,
-		Path:                path,
-		AuthIndex:           detail.AuthIndex,
-		Source:              detail.Source,
-		SourceHash:          hashString(detail.Source),
-		InputTokens:         detail.Tokens.InputTokens,
-		OutputTokens:        detail.Tokens.OutputTokens,
-		ReasoningTokens:     detail.Tokens.ReasoningTokens,
-		CachedTokens:        detail.Tokens.CachedTokens,
-		CacheReadTokens:     detail.Tokens.CacheReadTokens,
-		CacheCreationTokens: detail.Tokens.CacheCreationTokens,
-		CacheTokens:         detail.Tokens.CacheTokens,
-		TotalTokens:         detail.Tokens.TotalTokens,
-		LatencyMS:           latency,
-		Failed:              detail.Failed,
-		CreatedAtMS:         time.Now().UnixMilli(),
+		TimestampMS:          timestamp.UnixMilli(),
+		Timestamp:            timestamp.UTC().Format(time.RFC3339Nano),
+		Model:                nonEmpty(model, "unknown"),
+		Endpoint:             nonEmpty(endpoint, "-"),
+		Method:               method,
+		Path:                 path,
+		AuthIndex:            detail.AuthIndex,
+		Source:               detail.Source,
+		SourceHash:           hashString(detail.Source),
+		AccountSnapshot:      detail.AccountSnapshot,
+		AuthLabelSnapshot:    detail.AuthLabelSnapshot,
+		AuthFileSnapshot:     detail.AuthFileSnapshot,
+		AuthProviderSnapshot: detail.AuthProviderSnapshot,
+		AuthSnapshotAtMS:     detail.AuthSnapshotAtMS,
+		InputTokens:          detail.Tokens.InputTokens,
+		OutputTokens:         detail.Tokens.OutputTokens,
+		ReasoningTokens:      detail.Tokens.ReasoningTokens,
+		CachedTokens:         detail.Tokens.CachedTokens,
+		CacheReadTokens:      detail.Tokens.CacheReadTokens,
+		CacheCreationTokens:  detail.Tokens.CacheCreationTokens,
+		CacheTokens:          detail.Tokens.CacheTokens,
+		TotalTokens:          detail.Tokens.TotalTokens,
+		LatencyMS:            latency,
+		Failed:               detail.Failed,
+		CreatedAtMS:          time.Now().UnixMilli(),
 	}
 	event.EventHash = buildEventHash(event)
 	return event
@@ -750,32 +952,37 @@ func eventFromJSONRecord(data []byte) (Event, error) {
 	}
 	if eventHash := readString(record, "event_hash", "eventHash"); eventHash != "" {
 		event := Event{
-			RequestID:           readString(record, "request_id", "requestId"),
-			EventHash:           eventHash,
-			TimestampMS:         readInt(record, "timestamp_ms", "timestampMs"),
-			Timestamp:           readString(record, "timestamp"),
-			Provider:            readString(record, "provider"),
-			Model:               readString(record, "model"),
-			Endpoint:            readString(record, "endpoint"),
-			Method:              readString(record, "method"),
-			Path:                readString(record, "path"),
-			AuthType:            readString(record, "auth_type", "authType"),
-			AuthIndex:           readString(record, "auth_index", "authIndex", "AuthIndex"),
-			Source:              readString(record, "source"),
-			SourceHash:          readString(record, "source_hash", "sourceHash"),
-			APIKeyHash:          readString(record, "api_key_hash", "apiKeyHash"),
-			InputTokens:         readInt(record, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens"),
-			OutputTokens:        readInt(record, "output_tokens", "outputTokens", "completion_tokens", "completionTokens"),
-			ReasoningTokens:     readInt(record, "reasoning_tokens", "reasoningTokens"),
-			CachedTokens:        readInt(record, "cached_tokens", "cachedTokens"),
-			CacheReadTokens:     readInt(record, "cache_read_tokens", "cacheReadTokens"),
-			CacheCreationTokens: readInt(record, "cache_creation_tokens", "cacheCreationTokens"),
-			CacheTokens:         readInt(record, "cache_tokens", "cacheTokens"),
-			TotalTokens:         readInt(record, "total_tokens", "totalTokens", "total"),
-			LatencyMS:           readOptionalInt(record, "latency_ms", "latencyMs"),
-			Failed:              readBool(record, "failed", "is_failed", "isFailed"),
-			RawJSON:             readString(record, "raw_json", "rawJson"),
-			CreatedAtMS:         readInt(record, "created_at_ms", "createdAtMs"),
+			RequestID:            readString(record, "request_id", "requestId"),
+			EventHash:            eventHash,
+			TimestampMS:          readInt(record, "timestamp_ms", "timestampMs"),
+			Timestamp:            readString(record, "timestamp"),
+			Provider:             readString(record, "provider"),
+			Model:                readString(record, "model"),
+			Endpoint:             readString(record, "endpoint"),
+			Method:               readString(record, "method"),
+			Path:                 readString(record, "path"),
+			AuthType:             readString(record, "auth_type", "authType"),
+			AuthIndex:            readString(record, "auth_index", "authIndex", "AuthIndex"),
+			Source:               readString(record, "source"),
+			SourceHash:           readString(record, "source_hash", "sourceHash"),
+			APIKeyHash:           readString(record, "api_key_hash", "apiKeyHash"),
+			AccountSnapshot:      readString(record, "account_snapshot", "accountSnapshot"),
+			AuthLabelSnapshot:    readString(record, "auth_label_snapshot", "authLabelSnapshot"),
+			AuthFileSnapshot:     readString(record, "auth_file_snapshot", "authFileSnapshot"),
+			AuthProviderSnapshot: readString(record, "auth_provider_snapshot", "authProviderSnapshot"),
+			AuthSnapshotAtMS:     readInt(record, "auth_snapshot_at_ms", "authSnapshotAtMs"),
+			InputTokens:          readInt(record, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens"),
+			OutputTokens:         readInt(record, "output_tokens", "outputTokens", "completion_tokens", "completionTokens"),
+			ReasoningTokens:      readInt(record, "reasoning_tokens", "reasoningTokens"),
+			CachedTokens:         readInt(record, "cached_tokens", "cachedTokens"),
+			CacheReadTokens:      readInt(record, "cache_read_tokens", "cacheReadTokens"),
+			CacheCreationTokens:  readInt(record, "cache_creation_tokens", "cacheCreationTokens"),
+			CacheTokens:          readInt(record, "cache_tokens", "cacheTokens"),
+			TotalTokens:          readInt(record, "total_tokens", "totalTokens", "total"),
+			LatencyMS:            readOptionalInt(record, "latency_ms", "latencyMs"),
+			Failed:               readBool(record, "failed", "is_failed", "isFailed"),
+			RawJSON:              readString(record, "raw_json", "rawJson"),
+			CreatedAtMS:          readInt(record, "created_at_ms", "createdAtMs"),
 		}
 		if event.TimestampMS <= 0 || event.Timestamp == "" {
 			event.TimestampMS, event.Timestamp = readTimestamp(record)
@@ -805,31 +1012,36 @@ func eventFromJSONRecord(data []byte) (Event, error) {
 	rawJSON, _ := json.Marshal(redacted)
 
 	event := Event{
-		RequestID:           readString(record, "request_id", "requestId", "id"),
-		TimestampMS:         timestampMS,
-		Timestamp:           timestamp,
-		Provider:            readString(record, "provider", "type", "auth_type", "authType"),
-		Model:               nonEmpty(readString(record, "model", "model_name", "modelName"), "-"),
-		Endpoint:            endpoint,
-		Method:              method,
-		Path:                path,
-		AuthType:            readString(record, "auth_type", "authType"),
-		AuthIndex:           readString(record, "auth_index", "authIndex", "AuthIndex"),
-		Source:              maskSource(sourceRaw),
-		SourceHash:          hashString(sourceRaw),
-		APIKeyHash:          hashString(apiKey),
-		InputTokens:         tokens.InputTokens,
-		OutputTokens:        tokens.OutputTokens,
-		ReasoningTokens:     tokens.ReasoningTokens,
-		CachedTokens:        tokens.CachedTokens,
-		CacheReadTokens:     tokens.CacheReadTokens,
-		CacheCreationTokens: tokens.CacheCreationTokens,
-		CacheTokens:         tokens.CacheTokens,
-		TotalTokens:         tokens.TotalTokens,
-		LatencyMS:           readOptionalInt(record, "latency_ms", "latencyMs", "duration_ms", "durationMs", "elapsed_ms", "elapsedMs"),
-		Failed:              readFailed(record),
-		RawJSON:             string(rawJSON),
-		CreatedAtMS:         time.Now().UnixMilli(),
+		RequestID:            readString(record, "request_id", "requestId", "id"),
+		TimestampMS:          timestampMS,
+		Timestamp:            timestamp,
+		Provider:             readString(record, "provider", "type", "auth_type", "authType"),
+		Model:                nonEmpty(readString(record, "model", "model_name", "modelName"), "-"),
+		Endpoint:             endpoint,
+		Method:               method,
+		Path:                 path,
+		AuthType:             readString(record, "auth_type", "authType"),
+		AuthIndex:            readString(record, "auth_index", "authIndex", "AuthIndex"),
+		Source:               maskSource(sourceRaw),
+		SourceHash:           hashString(sourceRaw),
+		APIKeyHash:           hashString(apiKey),
+		AccountSnapshot:      readString(record, "account_snapshot", "accountSnapshot"),
+		AuthLabelSnapshot:    readString(record, "auth_label_snapshot", "authLabelSnapshot"),
+		AuthFileSnapshot:     readString(record, "auth_file_snapshot", "authFileSnapshot"),
+		AuthProviderSnapshot: readString(record, "auth_provider_snapshot", "authProviderSnapshot"),
+		AuthSnapshotAtMS:     readInt(record, "auth_snapshot_at_ms", "authSnapshotAtMs"),
+		InputTokens:          tokens.InputTokens,
+		OutputTokens:         tokens.OutputTokens,
+		ReasoningTokens:      tokens.ReasoningTokens,
+		CachedTokens:         tokens.CachedTokens,
+		CacheReadTokens:      tokens.CacheReadTokens,
+		CacheCreationTokens:  tokens.CacheCreationTokens,
+		CacheTokens:          tokens.CacheTokens,
+		TotalTokens:          tokens.TotalTokens,
+		LatencyMS:            readOptionalInt(record, "latency_ms", "latencyMs", "duration_ms", "durationMs", "elapsed_ms", "elapsedMs"),
+		Failed:               readFailed(record),
+		RawJSON:              string(rawJSON),
+		CreatedAtMS:          time.Now().UnixMilli(),
 	}
 	event.EventHash = buildEventHash(event)
 	return event, nil
@@ -907,31 +1119,36 @@ func eventFromLegacyDetail(endpoint, method, path, model string, detail map[stri
 		"detail":   redactValue(detail),
 	})
 	event := Event{
-		RequestID:           readString(detail, "request_id", "requestId", "id"),
-		TimestampMS:         timestampMS,
-		Timestamp:           timestamp,
-		Provider:            readString(detail, "provider", "type", "auth_type", "authType"),
-		Model:               nonEmpty(model, "-"),
-		Endpoint:            nonEmpty(endpoint, "-"),
-		Method:              method,
-		Path:                path,
-		AuthType:            readString(detail, "auth_type", "authType"),
-		AuthIndex:           readString(detail, "auth_index", "authIndex", "AuthIndex"),
-		Source:              maskSource(sourceRaw),
-		SourceHash:          hashString(sourceRaw),
-		APIKeyHash:          hashString(apiKey),
-		InputTokens:         tokens.InputTokens,
-		OutputTokens:        tokens.OutputTokens,
-		ReasoningTokens:     tokens.ReasoningTokens,
-		CachedTokens:        tokens.CachedTokens,
-		CacheReadTokens:     tokens.CacheReadTokens,
-		CacheCreationTokens: tokens.CacheCreationTokens,
-		CacheTokens:         tokens.CacheTokens,
-		TotalTokens:         tokens.TotalTokens,
-		LatencyMS:           readOptionalInt(detail, "latency_ms", "latencyMs", "duration_ms", "durationMs", "elapsed_ms", "elapsedMs"),
-		Failed:              readFailed(detail),
-		RawJSON:             string(rawJSON),
-		CreatedAtMS:         now,
+		RequestID:            readString(detail, "request_id", "requestId", "id"),
+		TimestampMS:          timestampMS,
+		Timestamp:            timestamp,
+		Provider:             readString(detail, "provider", "type", "auth_type", "authType"),
+		Model:                nonEmpty(model, "-"),
+		Endpoint:             nonEmpty(endpoint, "-"),
+		Method:               method,
+		Path:                 path,
+		AuthType:             readString(detail, "auth_type", "authType"),
+		AuthIndex:            readString(detail, "auth_index", "authIndex", "AuthIndex"),
+		Source:               maskSource(sourceRaw),
+		SourceHash:           hashString(sourceRaw),
+		APIKeyHash:           hashString(apiKey),
+		AccountSnapshot:      readString(detail, "account_snapshot", "accountSnapshot"),
+		AuthLabelSnapshot:    readString(detail, "auth_label_snapshot", "authLabelSnapshot"),
+		AuthFileSnapshot:     readString(detail, "auth_file_snapshot", "authFileSnapshot"),
+		AuthProviderSnapshot: readString(detail, "auth_provider_snapshot", "authProviderSnapshot"),
+		AuthSnapshotAtMS:     readInt(detail, "auth_snapshot_at_ms", "authSnapshotAtMs"),
+		InputTokens:          tokens.InputTokens,
+		OutputTokens:         tokens.OutputTokens,
+		ReasoningTokens:      tokens.ReasoningTokens,
+		CachedTokens:         tokens.CachedTokens,
+		CacheReadTokens:      tokens.CacheReadTokens,
+		CacheCreationTokens:  tokens.CacheCreationTokens,
+		CacheTokens:          tokens.CacheTokens,
+		TotalTokens:          tokens.TotalTokens,
+		LatencyMS:            readOptionalInt(detail, "latency_ms", "latencyMs", "duration_ms", "durationMs", "elapsed_ms", "elapsedMs"),
+		Failed:               readFailed(detail),
+		RawJSON:              string(rawJSON),
+		CreatedAtMS:          now,
 	}
 	event.EventHash = buildEventHash(event)
 	return event, nil
@@ -961,7 +1178,7 @@ func (s *RequestStatistics) LoadModelPrices(_ context.Context) (map[string]Model
 	return cloneModelPrices(s.modelPrices), nil
 }
 
-func (s *RequestStatistics) SaveModelPrices(_ context.Context, prices map[string]ModelPrice) (map[string]ModelPrice, error) {
+func (s *RequestStatistics) SaveModelPrices(ctx context.Context, prices map[string]ModelPrice) (map[string]ModelPrice, error) {
 	if s == nil {
 		return map[string]ModelPrice{}, nil
 	}
@@ -981,11 +1198,11 @@ func (s *RequestStatistics) SaveModelPrices(_ context.Context, prices map[string
 
 	s.mu.Lock()
 	s.modelPrices = normalized
-	path := s.modelPricesPath
+	store := s.store
 	s.mu.Unlock()
 
-	if path != "" {
-		if err := writeJSONFile(path, map[string]map[string]ModelPrice{"prices": normalized}); err != nil {
+	if store != nil {
+		if err := store.SaveModelPrices(ctx, normalized); err != nil {
 			return nil, err
 		}
 	}
@@ -1006,7 +1223,7 @@ func (s *RequestStatistics) SyncModelPrices(ctx context.Context, models []string
 	}
 	result := ModelPriceSyncResult{Source: modelPriceSyncSource, Skipped: skipped}
 	for model, price := range selected {
-		if !validPriceValue(price.Prompt) || !validPriceValue(price.Completion) || !validPriceValue(price.Cache) {
+		if err := validateModelPrice(model, price); err != nil {
 			result.Skipped++
 			continue
 		}
@@ -1016,18 +1233,20 @@ func (s *RequestStatistics) SyncModelPrices(ctx context.Context, models []string
 		result.Imported++
 	}
 	result.Prices = cloneModelPrices(s.modelPrices)
-	path := s.modelPricesPath
+	store := s.store
 	s.mu.Unlock()
 
-	if path != "" {
-		if err := writeJSONFile(path, map[string]map[string]ModelPrice{"prices": result.Prices}); err != nil {
+	if store != nil {
+		if storeResult, err := store.UpsertModelPrices(ctx, selected); err != nil {
 			return ModelPriceSyncResult{}, err
+		} else if len(storeResult.Prices) > 0 {
+			result.Prices = storeResult.Prices
 		}
 	}
 	return result, nil
 }
 
-func (s *RequestStatistics) loadModelPrices(path string) error {
+func (s *RequestStatistics) migrateLegacyModelPrices(path string) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -1041,8 +1260,37 @@ func (s *RequestStatistics) loadModelPrices(path string) error {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return fmt.Errorf("usage storage decode model prices: %w", err)
 	}
+	if len(payload.Prices) == 0 {
+		return nil
+	}
+	store := s.currentStore()
+	if store == nil {
+		return nil
+	}
+	existing, err := store.LoadModelPrices(context.Background())
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 {
+		return nil
+	}
+	if err := store.SaveModelPrices(context.Background(), payload.Prices); err != nil {
+		return fmt.Errorf("usage sqlite migrate model prices: %w", err)
+	}
+	return nil
+}
+
+func (s *RequestStatistics) loadModelPricesFromStore(ctx context.Context) error {
+	store := s.currentStore()
+	if store == nil {
+		return nil
+	}
+	prices, err := store.LoadModelPrices(ctx)
+	if err != nil {
+		return fmt.Errorf("usage sqlite load model prices: %w", err)
+	}
 	s.mu.Lock()
-	s.modelPrices = cloneModelPrices(payload.Prices)
+	s.modelPrices = cloneModelPrices(prices)
 	s.mu.Unlock()
 	return nil
 }
@@ -1160,21 +1408,6 @@ func cloneModelPrices(prices map[string]ModelPrice) map[string]ModelPrice {
 		out[model] = price
 	}
 	return out
-}
-
-func writeJSONFile(path string, payload any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o600)
-}
-
-func validPriceValue(value float64) bool {
-	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
