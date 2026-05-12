@@ -70,7 +70,7 @@ jobs:
 
           echo "has_changes=true" >> "${GITHUB_OUTPUT}"
 
-      - name: Check protected Kiro paths
+      - name: Check protected custom paths
         if: steps.merge.outputs.has_changes == 'true'
         id: guard
         env:
@@ -147,6 +147,62 @@ jobs:
             echo "validation_hit=false" >> "${GITHUB_OUTPUT}"
           fi
 
+          : > cpa_guarded_files.txt
+          while IFS= read -r pattern; do
+            [ -z "${pattern}" ] && continue
+            git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" -- "${pattern}" >> cpa_guarded_files.txt || true
+          done <<'EOF'
+          :(glob)internal/usage/**
+          internal/api/server.go
+          internal/api/server_test.go
+          internal/api/handlers/management/usage.go
+          internal/api/handlers/management/usage_test.go
+          :(glob)internal/redisqueue/**
+          :(glob)sdk/cliproxy/usage/**
+          internal/runtime/executor/helps/usage_helpers.go
+          EOF
+
+          sort -u cpa_guarded_files.txt -o cpa_guarded_files.txt
+          if [ -s cpa_guarded_files.txt ]; then
+            echo "cpa_protected_hit=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo "cpa_guarded_files<<EOF"
+              cat cpa_guarded_files.txt
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            echo "cpa_protected_hit=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+          : > cpa_validation_files.txt
+          while IFS= read -r pattern; do
+            [ -z "${pattern}" ] && continue
+            git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" -- "${pattern}" >> cpa_validation_files.txt || true
+          done <<'EOF'
+          :(glob)internal/usage/**
+          internal/api/server.go
+          internal/api/server_test.go
+          internal/api/handlers/management/usage.go
+          internal/api/handlers/management/usage_test.go
+          :(glob)internal/redisqueue/**
+          :(glob)sdk/cliproxy/usage/**
+          internal/runtime/executor/helps/usage_helpers.go
+          go.mod
+          go.sum
+          EOF
+
+          sort -u cpa_validation_files.txt -o cpa_validation_files.txt
+          if [ -s cpa_validation_files.txt ]; then
+            echo "cpa_validation_hit=true" >> "${GITHUB_OUTPUT}"
+            {
+              echo "cpa_validation_files<<EOF"
+              cat cpa_validation_files.txt
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+          else
+            echo "cpa_validation_hit=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Push sync branch
         if: steps.merge.outputs.has_changes == 'true'
         run: |
@@ -161,14 +217,22 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PROTECTED_HIT: ${{ steps.guard.outputs.protected_hit }}
           VALIDATION_HIT: ${{ steps.guard.outputs.validation_hit }}
+          CPA_PROTECTED_HIT: ${{ steps.guard.outputs.cpa_protected_hit }}
+          CPA_VALIDATION_HIT: ${{ steps.guard.outputs.cpa_validation_hit }}
           GUARDED_FILES: ${{ steps.guard.outputs.guarded_files }}
           VALIDATION_FILES: ${{ steps.guard.outputs.validation_files }}
+          CPA_GUARDED_FILES: ${{ steps.guard.outputs.cpa_guarded_files }}
+          CPA_VALIDATION_FILES: ${{ steps.guard.outputs.cpa_validation_files }}
           CHANGED_FILES: ${{ steps.guard.outputs.changed_files }}
         run: |
           set -euo pipefail
 
-          if [ "${PROTECTED_HIT}" = "true" ]; then
+          if [ "${PROTECTED_HIT}" = "true" ] && [ "${CPA_PROTECTED_HIT}" = "true" ]; then
+            PR_TITLE="chore: sync upstream changes [manual Kiro/usage review required]"
+          elif [ "${PROTECTED_HIT}" = "true" ]; then
             PR_TITLE="chore: sync upstream changes [manual Kiro review required]"
+          elif [ "${CPA_PROTECTED_HIT}" = "true" ]; then
+            PR_TITLE="chore: sync upstream changes [manual usage review required]"
           else
             PR_TITLE="chore: sync upstream changes"
           fi
@@ -180,6 +244,8 @@ jobs:
           - Upstream branch: \`${UPSTREAM_BRANCH}\`
           - Protected Kiro paths changed: **${PROTECTED_HIT}**
           - Kiro targeted validation required: **${VALIDATION_HIT}**
+          - CPA-Manager usage paths changed: **${CPA_PROTECTED_HIT}**
+          - CPA-Manager usage validation required: **${CPA_VALIDATION_HIT}**
 
           Changed files:
           \`\`\`
@@ -199,12 +265,34 @@ jobs:
           EOF
           fi
 
+          if [ "${CPA_PROTECTED_HIT}" = "true" ]; then
+            cat >> pr-body.md <<EOF
+
+          CPA-Manager/SQLite usage files that require manual review:
+          \`\`\`
+          ${CPA_GUARDED_FILES}
+          \`\`\`
+
+          This PR must not be merged blindly because it touches embedded CPA-Manager usage monitoring.
+          EOF
+          fi
+
           if [ "${VALIDATION_HIT}" = "true" ]; then
             cat >> pr-body.md <<EOF
 
           Kiro targeted validation paths:
           \`\`\`
           ${VALIDATION_FILES}
+          \`\`\`
+          EOF
+          fi
+
+          if [ "${CPA_VALIDATION_HIT}" = "true" ]; then
+            cat >> pr-body.md <<EOF
+
+          CPA-Manager usage targeted validation paths:
+          \`\`\`
+          ${CPA_VALIDATION_FILES}
           \`\`\`
           EOF
           fi
@@ -216,8 +304,8 @@ jobs:
             gh pr create --repo "${TARGET_REPO}" --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file pr-body.md
           fi
 
-      - name: Set up Go for Kiro targeted validation
-        if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.validation_hit == 'true'
+      - name: Set up Go for targeted validation
+        if: steps.merge.outputs.has_changes == 'true' && (steps.guard.outputs.validation_hit == 'true' || steps.guard.outputs.cpa_validation_hit == 'true')
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -246,14 +334,56 @@ jobs:
             echo "\`\`\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Block automatic progression on protected paths
-        if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.protected_hit == 'true'
+      - name: Run CPA-Manager usage targeted validation
+        if: steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.cpa_validation_hit == 'true'
+        id: usage_validate
+        run: bash scripts/run_usage_targeted_tests.sh
+
+      - name: Summarize CPA-Manager usage targeted validation
+        if: always() && steps.merge.outputs.has_changes == 'true' && steps.guard.outputs.cpa_validation_hit == 'true'
+        env:
+          VALIDATION_FILES: ${{ steps.guard.outputs.cpa_validation_files }}
+          VALIDATION_OUTCOME: ${{ steps.usage_validate.outcome }}
         run: |
           set -euo pipefail
           {
-            echo "## Kiro path guard triggered"
+            echo "## CPA-Manager usage targeted validation"
             echo
-            echo "The sync PR was created or updated, but protected Kiro-related files changed."
+            echo "Outcome: \`${VALIDATION_OUTCOME}\`"
+            echo
+            echo "Triggered by these files:"
+            echo "\`\`\`"
+            echo "${VALIDATION_FILES}"
+            echo "\`\`\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Block automatic progression on protected paths
+        if: steps.merge.outputs.has_changes == 'true' && (steps.guard.outputs.protected_hit == 'true' || steps.guard.outputs.cpa_protected_hit == 'true')
+        env:
+          KIRO_PROTECTED_HIT: ${{ steps.guard.outputs.protected_hit }}
+          CPA_PROTECTED_HIT: ${{ steps.guard.outputs.cpa_protected_hit }}
+          KIRO_GUARDED_FILES: ${{ steps.guard.outputs.guarded_files }}
+          CPA_GUARDED_FILES: ${{ steps.guard.outputs.cpa_guarded_files }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Protected path guard triggered"
+            echo
+            echo "The sync PR was created or updated, but protected custom files changed."
             echo "Manual review is required before any merge."
+            if [ "${KIRO_PROTECTED_HIT}" = "true" ]; then
+              echo
+              echo "Kiro guarded files:"
+              echo "\`\`\`"
+              echo "${KIRO_GUARDED_FILES}"
+              echo "\`\`\`"
+            fi
+            if [ "${CPA_PROTECTED_HIT}" = "true" ]; then
+              echo
+              echo "CPA-Manager usage guarded files:"
+              echo "\`\`\`"
+              echo "${CPA_GUARDED_FILES}"
+              echo "\`\`\`"
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
           exit 1
