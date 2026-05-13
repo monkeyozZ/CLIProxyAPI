@@ -26,6 +26,7 @@ import (
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -223,6 +224,7 @@ type CollectorStatus struct {
 	Mode           string `json:"mode"`
 	Transport      string `json:"transport"`
 	Queue          string `json:"queue"`
+	Backup         string `json:"backup,omitempty"`
 	LastConsumedAt int64  `json:"lastConsumedAt"`
 	LastInsertedAt int64  `json:"lastInsertedAt"`
 	TotalInserted  int64  `json:"totalInserted"`
@@ -263,6 +265,7 @@ type RequestStatistics struct {
 	legacyEventsPath      string
 	legacyModelPricesPath string
 	store                 *sqliteUsageStore
+	backupStore           *postgresUsageStore
 	modelPrices           map[string]ModelPrice
 }
 
@@ -274,6 +277,16 @@ func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics
 // GetServiceStatus returns the embedded usage service status.
 func GetServiceStatus(ctx context.Context) (ServiceStatus, error) {
 	return defaultRequestStatistics.ServiceStatus(ctx)
+}
+
+// ClearHistory removes persisted request statistics while preserving model prices.
+func ClearHistory(ctx context.Context) error {
+	return defaultRequestStatistics.ClearHistory(ctx)
+}
+
+// ClearHistoryRange removes persisted request statistics within the timestamp range.
+func ClearHistoryRange(ctx context.Context, startMS, endMS *int64) error {
+	return defaultRequestStatistics.ClearHistoryRange(ctx, startMS, endMS)
 }
 
 // NewRequestStatistics constructs an empty statistics store.
@@ -314,24 +327,36 @@ func (s *RequestStatistics) ConfigureStorage(configFilePath string) error {
 	if err != nil {
 		return fmt.Errorf("usage sqlite open: %w", err)
 	}
+	backupStore, err := openConfiguredPostgresUsageStore(context.Background())
+	if err != nil {
+		log.WithError(err).Warn("failed to configure usage postgres backup")
+	}
 
 	s.mu.Lock()
 	if s.dbPath == dbPath && s.store != nil {
 		s.mu.Unlock()
 		_ = store.Close()
+		if backupStore != nil {
+			_ = backupStore.Close()
+		}
 		return nil
 	}
 	oldStore := s.store
+	oldBackupStore := s.backupStore
 	s.resetAggregatesLocked()
 	s.storageDir = dir
 	s.dbPath = dbPath
 	s.legacyEventsPath = legacyEventsPath
 	s.legacyModelPricesPath = legacyModelPricesPath
 	s.store = store
+	s.backupStore = backupStore
 	s.mu.Unlock()
 
 	if oldStore != nil {
 		_ = oldStore.Close()
+	}
+	if oldBackupStore != nil {
+		_ = oldBackupStore.Close()
 	}
 
 	if err := s.migrateLegacyEvents(legacyEventsPath); err != nil {
@@ -343,8 +368,14 @@ func (s *RequestStatistics) ConfigureStorage(configFilePath string) error {
 	if err := s.loadEventsFromStore(context.Background()); err != nil {
 		return err
 	}
+	if err := s.syncEventsWithBackupStore(context.Background()); err != nil {
+		log.WithError(err).Warn("failed to sync usage events with postgres backup")
+	}
 	if err := s.loadModelPricesFromStore(context.Background()); err != nil {
 		return err
+	}
+	if err := s.syncModelPricesWithBackupStore(context.Background()); err != nil {
+		log.WithError(err).Warn("failed to sync usage model prices with postgres backup")
 	}
 	return nil
 }
@@ -362,6 +393,20 @@ func (s *RequestStatistics) resetAggregatesLocked() {
 	s.eventHashes = make(map[string]struct{})
 	s.skippedEvents = 0
 	s.modelPrices = make(map[string]ModelPrice)
+}
+
+func (s *RequestStatistics) resetEventAggregatesLocked() {
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+	s.apis = make(map[string]*apiStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+	s.eventHashes = make(map[string]struct{})
+	s.skippedEvents = 0
 }
 
 func resolveStorageDir(configFilePath string) string {
@@ -386,7 +431,9 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	event := normalizeEvent(eventFromUsageRecord(ctx, record))
 	inserted := s.insertEvent(event)
 	if inserted {
-		_ = s.persistEvent(ctx, event)
+		if err := s.persistEvent(ctx, event); err != nil {
+			log.WithError(err).Warn("failed to persist usage event")
+		}
 	} else {
 		s.addSkipped(1)
 	}
@@ -667,7 +714,11 @@ func (s *RequestStatistics) ServiceStatus(ctx context.Context) (ServiceStatus, e
 	s.mu.RLock()
 	status.DBPath = s.dbPath
 	store := s.store
+	backupStore := s.backupStore
 	status.Collector.TotalSkipped = s.skippedEvents
+	if backupStore != nil {
+		status.Collector.Backup = "postgres"
+	}
 	s.mu.RUnlock()
 
 	if store == nil {
@@ -690,6 +741,43 @@ func (s *RequestStatistics) ServiceStatus(ctx context.Context) (ServiceStatus, e
 	return status, nil
 }
 
+// ClearHistory removes usage event history from every configured store.
+func (s *RequestStatistics) ClearHistory(ctx context.Context) error {
+	return s.ClearHistoryRange(ctx, nil, nil)
+}
+
+// ClearHistoryRange removes usage event history from every configured store within a range.
+func (s *RequestStatistics) ClearHistoryRange(ctx context.Context, startMS, endMS *int64) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if startMS != nil && endMS != nil && *startMS > *endMS {
+		return errors.New("usage clear range start is after end")
+	}
+	store, backupStore := s.currentStores()
+	if backupStore != nil {
+		if err := backupStore.ClearEvents(ctx, startMS, endMS); err != nil {
+			return fmt.Errorf("usage postgres clear events: %w", err)
+		}
+	}
+	if store != nil {
+		if err := store.ClearEvents(ctx, startMS, endMS); err != nil {
+			return fmt.Errorf("usage sqlite clear events: %w", err)
+		}
+	}
+
+	s.mu.Lock()
+	s.resetEventAggregatesLocked()
+	s.mu.Unlock()
+	if err := s.loadEventsFromStore(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
 // ImportEvents merges events into the current store and appends new events to disk.
 func (s *RequestStatistics) ImportEvents(parsed ImportParseResult) MergeResult {
 	result := MergeResult{
@@ -706,7 +794,9 @@ func (s *RequestStatistics) ImportEvents(parsed ImportParseResult) MergeResult {
 		event = normalizeEvent(event)
 		if s.insertEvent(event) {
 			result.Added++
-			_ = s.persistEvent(context.Background(), event)
+			if err := s.persistEvent(context.Background(), event); err != nil {
+				log.WithError(err).Warn("failed to persist imported usage event")
+			}
 		} else {
 			result.Skipped++
 			s.addSkipped(1)
@@ -774,6 +864,36 @@ func (s *RequestStatistics) loadEventsFromStore(ctx context.Context) error {
 	return nil
 }
 
+func (s *RequestStatistics) syncEventsWithBackupStore(ctx context.Context) error {
+	store, backupStore := s.currentStores()
+	if store == nil || backupStore == nil {
+		return nil
+	}
+
+	localEvents, err := store.Events(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("usage sqlite read events for backup sync: %w", err)
+	}
+	if len(localEvents) > 0 {
+		if _, err := backupStore.InsertEvents(ctx, localEvents); err != nil {
+			return fmt.Errorf("usage postgres backup local events: %w", err)
+		}
+	}
+
+	backupEvents, err := backupStore.Events(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("usage postgres load backup events: %w", err)
+	}
+	for _, event := range backupEvents {
+		if s.insertEvent(event) {
+			if _, err := store.InsertEvents(ctx, []Event{event}); err != nil {
+				return fmt.Errorf("usage sqlite restore backup event: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *RequestStatistics) currentStore() *sqliteUsageStore {
 	s.mu.RLock()
 	store := s.store
@@ -781,21 +901,38 @@ func (s *RequestStatistics) currentStore() *sqliteUsageStore {
 	return store
 }
 
+func (s *RequestStatistics) currentStores() (*sqliteUsageStore, *postgresUsageStore) {
+	s.mu.RLock()
+	store := s.store
+	backupStore := s.backupStore
+	s.mu.RUnlock()
+	return store, backupStore
+}
+
 func (s *RequestStatistics) persistEvent(ctx context.Context, event Event) error {
-	store := s.currentStore()
-	if store == nil {
-		return nil
+	store, backupStore := s.currentStores()
+	var firstErr error
+	if store != nil {
+		if _, err := store.InsertEvents(ctx, []Event{event}); err != nil {
+			firstErr = err
+		}
 	}
-	_, err := store.InsertEvents(ctx, []Event{event})
-	return err
+	if backupStore != nil {
+		if _, err := backupStore.InsertEvents(ctx, []Event{event}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *RequestStatistics) addDeadLetter(ctx context.Context, payload string, err error) {
-	store := s.currentStore()
-	if store == nil {
-		return
+	store, backupStore := s.currentStores()
+	if store != nil {
+		_ = store.AddDeadLetter(ctx, payload, err)
 	}
-	_ = store.AddDeadLetter(ctx, payload, err)
+	if backupStore != nil {
+		_ = backupStore.AddDeadLetter(ctx, payload, err)
+	}
 }
 
 // ExportJSONL returns persisted usage events as newline-delimited JSON.
@@ -1199,10 +1336,16 @@ func (s *RequestStatistics) SaveModelPrices(ctx context.Context, prices map[stri
 	s.mu.Lock()
 	s.modelPrices = normalized
 	store := s.store
+	backupStore := s.backupStore
 	s.mu.Unlock()
 
 	if store != nil {
 		if err := store.SaveModelPrices(ctx, normalized); err != nil {
+			return nil, err
+		}
+	}
+	if backupStore != nil {
+		if err := backupStore.SaveModelPrices(ctx, normalized); err != nil {
 			return nil, err
 		}
 	}
@@ -1234,6 +1377,7 @@ func (s *RequestStatistics) SyncModelPrices(ctx context.Context, models []string
 	}
 	result.Prices = cloneModelPrices(s.modelPrices)
 	store := s.store
+	backupStore := s.backupStore
 	s.mu.Unlock()
 
 	if store != nil {
@@ -1241,6 +1385,13 @@ func (s *RequestStatistics) SyncModelPrices(ctx context.Context, models []string
 			return ModelPriceSyncResult{}, err
 		} else if len(storeResult.Prices) > 0 {
 			result.Prices = storeResult.Prices
+		}
+	}
+	if backupStore != nil {
+		if backupResult, err := backupStore.UpsertModelPrices(ctx, selected); err != nil {
+			return ModelPriceSyncResult{}, err
+		} else if len(result.Prices) == 0 && len(backupResult.Prices) > 0 {
+			result.Prices = backupResult.Prices
 		}
 	}
 	return result, nil
@@ -1291,6 +1442,37 @@ func (s *RequestStatistics) loadModelPricesFromStore(ctx context.Context) error 
 	}
 	s.mu.Lock()
 	s.modelPrices = cloneModelPrices(prices)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *RequestStatistics) syncModelPricesWithBackupStore(ctx context.Context) error {
+	store, backupStore := s.currentStores()
+	if store == nil || backupStore == nil {
+		return nil
+	}
+	localPrices, err := store.LoadModelPrices(ctx)
+	if err != nil {
+		return fmt.Errorf("usage sqlite read model prices for backup sync: %w", err)
+	}
+	backupPrices, err := backupStore.LoadModelPrices(ctx)
+	if err != nil {
+		return fmt.Errorf("usage postgres load backup model prices: %w", err)
+	}
+
+	merged := mergeModelPrices(localPrices, backupPrices)
+	if len(merged) == 0 {
+		return nil
+	}
+	if err := store.SaveModelPrices(ctx, merged); err != nil {
+		return fmt.Errorf("usage sqlite restore backup model prices: %w", err)
+	}
+	if err := backupStore.SaveModelPrices(ctx, merged); err != nil {
+		return fmt.Errorf("usage postgres backup model prices: %w", err)
+	}
+
+	s.mu.Lock()
+	s.modelPrices = cloneModelPrices(merged)
 	s.mu.Unlock()
 	return nil
 }
@@ -1408,6 +1590,17 @@ func cloneModelPrices(prices map[string]ModelPrice) map[string]ModelPrice {
 		out[model] = price
 	}
 	return out
+}
+
+func mergeModelPrices(left, right map[string]ModelPrice) map[string]ModelPrice {
+	merged := cloneModelPrices(left)
+	for model, price := range right {
+		current, ok := merged[model]
+		if !ok || price.UpdatedAtMS >= current.UpdatedAtMS {
+			merged[model] = price
+		}
+	}
+	return merged
 }
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {

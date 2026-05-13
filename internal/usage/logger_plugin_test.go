@@ -51,6 +51,8 @@ func TestRequestStatisticsRecordBuildsEndpointSnapshot(t *testing.T) {
 }
 
 func TestRequestStatisticsPersistsEventsInSQLite(t *testing.T) {
+	disableUsagePostgresBackup(t)
+
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 
@@ -108,6 +110,8 @@ func TestRequestStatisticsPersistsEventsInSQLite(t *testing.T) {
 }
 
 func TestRequestStatisticsMigratesLegacyJSONLToSQLite(t *testing.T) {
+	disableUsagePostgresBackup(t)
+
 	dir := t.TempDir()
 	usageDir := filepath.Join(dir, "usage")
 	if err := os.MkdirAll(usageDir, 0o755); err != nil {
@@ -143,6 +147,109 @@ func TestRequestStatisticsMigratesLegacyJSONLToSQLite(t *testing.T) {
 	if len(exported) == 0 {
 		t.Fatal("ExportJSONL returned empty data")
 	}
+}
+
+func TestRequestStatisticsClearHistoryPreservesModelPrices(t *testing.T) {
+	disableUsagePostgresBackup(t)
+
+	dir := t.TempDir()
+	stats := NewRequestStatistics()
+	if err := stats.ConfigureStorage(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("ConfigureStorage: %v", err)
+	}
+	stats.Record(context.Background(), coreusage.Record{
+		Provider:    "kiro",
+		Model:       "claude-opus-4.7",
+		RequestedAt: time.Date(2026, 5, 12, 8, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 5,
+		},
+	})
+	if _, err := stats.SaveModelPrices(context.Background(), map[string]ModelPrice{
+		"claude-opus-4.7": {Prompt: 1, Completion: 2, Cache: 0.5},
+	}); err != nil {
+		t.Fatalf("SaveModelPrices: %v", err)
+	}
+
+	if err := stats.ClearHistory(context.Background()); err != nil {
+		t.Fatalf("ClearHistory: %v", err)
+	}
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 0 || len(snapshot.APIs) != 0 {
+		t.Fatalf("snapshot after clear = %+v, want empty history", snapshot)
+	}
+	status, err := stats.ServiceStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ServiceStatus: %v", err)
+	}
+	if status.Events != 0 || status.DeadLetters != 0 || status.Collector.TotalInserted != 0 {
+		t.Fatalf("status after clear = %+v, want no persisted events", status)
+	}
+	prices, err := stats.LoadModelPrices(context.Background())
+	if err != nil {
+		t.Fatalf("LoadModelPrices: %v", err)
+	}
+	if _, ok := prices["claude-opus-4.7"]; !ok {
+		t.Fatalf("model prices after clear = %+v, want preserved price", prices)
+	}
+}
+
+func TestRequestStatisticsClearHistoryRange(t *testing.T) {
+	disableUsagePostgresBackup(t)
+
+	dir := t.TempDir()
+	stats := NewRequestStatistics()
+	if err := stats.ConfigureStorage(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("ConfigureStorage: %v", err)
+	}
+	baseTime := time.Date(2026, 5, 12, 8, 0, 0, 0, time.UTC)
+	for index := 0; index < 3; index++ {
+		stats.Record(context.Background(), coreusage.Record{
+			Provider:    "kiro",
+			Model:       "claude-opus-4.7",
+			Source:      "user@example.com",
+			AuthIndex:   "kiro.json#1",
+			RequestedAt: baseTime.Add(time.Duration(index) * time.Hour),
+			Detail: coreusage.Detail{
+				InputTokens:  int64(10 + index),
+				OutputTokens: 5,
+			},
+		})
+	}
+	statusBefore, err := stats.ServiceStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ServiceStatus before clear: %v", err)
+	}
+	if statusBefore.Events != 3 {
+		t.Fatalf("events before range clear = %d, want 3", statusBefore.Events)
+	}
+
+	startMS := baseTime.Add(30 * time.Minute).UnixMilli()
+	endMS := baseTime.Add(90 * time.Minute).UnixMilli()
+	if err := stats.ClearHistoryRange(context.Background(), &startMS, &endMS); err != nil {
+		t.Fatalf("ClearHistoryRange: %v", err)
+	}
+
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 2 {
+		t.Fatalf("total requests after range clear = %d, want 2", snapshot.TotalRequests)
+	}
+	status, err := stats.ServiceStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ServiceStatus: %v", err)
+	}
+	if status.Events != 2 || status.Collector.TotalInserted != 2 {
+		t.Fatalf("status after range clear = %+v, want 2 persisted events", status)
+	}
+}
+
+func disableUsagePostgresBackup(t *testing.T) {
+	t.Helper()
+	t.Setenv("USAGE_POSTGRES_DSN", "")
+	t.Setenv("usage_postgres_dsn", "")
+	t.Setenv("PGSTORE_DSN", "")
+	t.Setenv("pgstore_dsn", "")
 }
 
 func TestParseImportPayloadAcceptsLegacyUsageExport(t *testing.T) {

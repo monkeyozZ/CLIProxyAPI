@@ -45,6 +45,58 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	c.JSON(http.StatusOK, snapshot)
 }
 
+// DeleteUsageStatistics clears embedded request statistics history.
+func (h *Handler) DeleteUsageStatistics(c *gin.Context) {
+	startMS, endMS, err := parseUsageClearTimeRange(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := usage.ClearHistoryRange(c.Request.Context(), startMS, endMS); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	status, err := usage.GetServiceStatus(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"usage":  status,
+	})
+}
+
+func parseUsageClearTimeRange(c *gin.Context) (*int64, *int64, error) {
+	startMS, err := parseOptionalUnixMSQuery(c, "startMs", "start_ms", "start", "from")
+	if err != nil {
+		return nil, nil, err
+	}
+	endMS, err := parseOptionalUnixMSQuery(c, "endMs", "end_ms", "end", "to")
+	if err != nil {
+		return nil, nil, err
+	}
+	if startMS != nil && endMS != nil && *startMS > *endMS {
+		return nil, nil, errors.New("start time cannot be later than end time")
+	}
+	return startMS, endMS, nil
+}
+
+func parseOptionalUnixMSQuery(c *gin.Context, keys ...string) (*int64, error) {
+	for _, key := range keys {
+		raw := strings.TrimSpace(c.Query(key))
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 0 {
+			return nil, errors.New("time range must use non-negative unix milliseconds")
+		}
+		return &value, nil
+	}
+	return nil, nil
+}
+
 // ExportUsageStatistics returns a usage export compatible with both the legacy
 // management panel and CPA-Manager's JSONL importer.
 func (h *Handler) ExportUsageStatistics(c *gin.Context) {
