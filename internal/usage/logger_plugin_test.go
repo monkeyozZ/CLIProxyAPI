@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,6 +93,17 @@ func TestRequestStatisticsPersistsEventsInSQLite(t *testing.T) {
 	}
 	if status.Collector.LastConsumedAt == 0 || status.Collector.LastInsertedAt == 0 {
 		t.Fatalf("status missing event timestamps: %+v", status.Collector)
+	}
+	store := reloaded.currentStore()
+	if store == nil {
+		t.Fatal("expected sqlite store")
+	}
+	var journalMode string
+	if err := store.db.QueryRowContext(context.Background(), `pragma journal_mode`).Scan(&journalMode); err != nil {
+		t.Fatalf("query journal mode: %v", err)
+	}
+	if !strings.EqualFold(journalMode, "delete") {
+		t.Fatalf("journal mode = %q, want delete", journalMode)
 	}
 }
 

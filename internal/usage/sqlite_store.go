@@ -31,6 +31,8 @@ func openSQLiteUsageStore(path string) (*sqliteUsageStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	store := &sqliteUsageStore{db: db}
 	if err := store.init(); err != nil {
 		_ = db.Close()
@@ -48,7 +50,7 @@ func (s *sqliteUsageStore) Close() error {
 
 func (s *sqliteUsageStore) init() error {
 	statements := []string{
-		`pragma journal_mode = WAL`,
+		`pragma journal_mode = DELETE`,
 		`pragma synchronous = FULL`,
 		`pragma busy_timeout = 5000`,
 		`pragma foreign_keys = ON`,
