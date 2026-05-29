@@ -103,6 +103,11 @@ func TestBuildKiroRegistryModelsFiltersUnsupportedModels(t *testing.T) {
 			},
 		},
 		{
+			ModelID:     "claude-opus-4.8",
+			ModelName:   "Claude Opus 4.8",
+			Description: "Latest Kiro Opus model",
+		},
+		{
 			ModelID:     "claude-opus-4.7",
 			ModelName:   "Claude Opus 4.7",
 			Description: "Latest Kiro Opus model",
@@ -117,8 +122,8 @@ func TestBuildKiroRegistryModelsFiltersUnsupportedModels(t *testing.T) {
 		{ModelID: "claude-sonnet-4.6", ModelName: "Duplicate"},
 	})
 
-	if len(models) != 3 {
-		t.Fatalf("expected 3 supported models, got %d", len(models))
+	if len(models) != 4 {
+		t.Fatalf("expected 4 supported models, got %d", len(models))
 	}
 	if models[0].ID != "claude-sonnet-4.6" {
 		t.Fatalf("expected model id claude-sonnet-4.6, got %q", models[0].ID)
@@ -138,17 +143,23 @@ func TestBuildKiroRegistryModelsFiltersUnsupportedModels(t *testing.T) {
 	if len(models[0].SupportedInputModalities) != 2 {
 		t.Fatalf("expected supported input modalities to be preserved, got %v", models[0].SupportedInputModalities)
 	}
-	if models[1].ID != "claude-opus-4.7" {
-		t.Fatalf("expected second model id claude-opus-4.7, got %q", models[1].ID)
+	if models[1].ID != "claude-opus-4.8" {
+		t.Fatalf("expected second model id claude-opus-4.8, got %q", models[1].ID)
 	}
 	if models[1].Type != "claude" {
-		t.Fatalf("expected opus 4.7 type claude, got %q", models[1].Type)
+		t.Fatalf("expected opus 4.8 type claude, got %q", models[1].Type)
 	}
-	if models[2].ID != "glm-5" {
-		t.Fatalf("expected third model id glm-5, got %q", models[2].ID)
+	if models[2].ID != "claude-opus-4.7" {
+		t.Fatalf("expected third model id claude-opus-4.7, got %q", models[2].ID)
 	}
-	if models[2].Type != "openai" {
-		t.Fatalf("expected glm-5 type openai, got %q", models[2].Type)
+	if models[2].Type != "claude" {
+		t.Fatalf("expected opus 4.7 type claude, got %q", models[2].Type)
+	}
+	if models[3].ID != "glm-5" {
+		t.Fatalf("expected fourth model id glm-5, got %q", models[3].ID)
+	}
+	if models[3].Type != "openai" {
+		t.Fatalf("expected glm-5 type openai, got %q", models[3].Type)
 	}
 }
 
@@ -162,6 +173,9 @@ func TestKiroMapModelSupportsDirectCatalogModels(t *testing.T) {
 		{input: "glm-5", want: "glm-5"},
 		{input: "qwen3-coder-next", want: "qwen3-coder-next"},
 		{input: "minimax-m2.5", want: "minimax-m2.5"},
+		{input: "claude-opus-4.8", want: "claude-opus-4.8"},
+		{input: "claude-opus-4-8", want: "claude-opus-4.8"},
+		{input: "claude-opus-4.8-agentic", want: "claude-opus-4.8"},
 		{input: "claude-opus-4.7", want: "claude-opus-4.7"},
 		{input: "claude-opus-4-7", want: "claude-opus-4.7"},
 		{input: "claude-opus-4.7-agentic", want: "claude-opus-4.7"},
