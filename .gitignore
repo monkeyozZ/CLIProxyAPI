@@ -42,6 +42,7 @@ GEMINI.md
 .gemini/*
 .serena/*
 .agent/*
+.agents
 .agents/*
 .opencode/*
 .idea/*
