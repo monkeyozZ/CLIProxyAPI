@@ -918,6 +918,14 @@ func extractAnthropicWebSearchToolResultText(raw json.RawMessage) string {
 	return builder.String()
 }
 
+func stringValue(values map[string]any, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	value, _ := values[key].(string)
+	return value
+}
+
 func stripAnthropicControlChars(text string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
