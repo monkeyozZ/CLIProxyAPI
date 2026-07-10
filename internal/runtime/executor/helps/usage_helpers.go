@@ -447,6 +447,38 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 	return auth.AuthKind()
 }
 
+// StreamUsageBuffer keeps the latest usage detail observed in a stream.
+type StreamUsageBuffer struct {
+	detail usage.Detail
+	ok     bool
+}
+
+// Observe records detail when ok is true, allowing the final stream usage to win.
+func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
+	if b == nil || !ok {
+		return
+	}
+	b.detail = detail
+	b.ok = true
+}
+
+// Publish emits the latest observed usage detail, if any.
+func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter) bool {
+	if b == nil || !b.ok || reporter == nil {
+		return false
+	}
+	reporter.Publish(ctx, b.detail)
+	return true
+}
+
+// Detail returns the latest observed usage detail.
+func (b *StreamUsageBuffer) Detail() (usage.Detail, bool) {
+	if b == nil || !b.ok {
+		return usage.Detail{}, false
+	}
+	return b.detail, true
+}
+
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data).Get("response.usage")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
@@ -482,6 +514,7 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("total_tokens").Exists() ||
 		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
+		usageNode.Get("input_tokens_details.cache_write_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
 		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
 }
@@ -506,6 +539,9 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
+	}
+	if cacheWrite := usageNode.Get("input_tokens_details.cache_write_tokens"); cacheWrite.Exists() {
+		detail.CacheCreationTokens = cacheWrite.Int()
 	}
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {

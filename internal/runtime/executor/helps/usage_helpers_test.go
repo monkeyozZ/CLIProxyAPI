@@ -51,6 +51,29 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 }
 
+func TestParseCodexUsageIncludesCacheWriteTokens(t *testing.T) {
+	data := []byte(`{"response":{"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":30,"cache_write_tokens":40}}}}`)
+	detail, ok := ParseCodexUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 100 {
+		t.Fatalf("input tokens = %d, want 100", detail.InputTokens)
+	}
+	if detail.OutputTokens != 20 {
+		t.Fatalf("output tokens = %d, want 20", detail.OutputTokens)
+	}
+	if detail.CachedTokens != 30 {
+		t.Fatalf("cached tokens = %d, want 30", detail.CachedTokens)
+	}
+	if detail.CacheCreationTokens != 40 {
+		t.Fatalf("cache creation tokens = %d, want 40", detail.CacheCreationTokens)
+	}
+	if detail.TotalTokens != 120 {
+		t.Fatalf("total tokens = %d, want 120", detail.TotalTokens)
+	}
+}
+
 func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
 	data := []byte(`{"usage":null}`)
 	detail := ParseOpenAIUsage(data)
@@ -86,6 +109,43 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 2 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 2)
+	}
+}
+
+func TestStreamUsageBufferKeepsLastUsage(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.Observe(usage.Detail{}, true)
+	buffer.Observe(usage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}, false)
+	buffer.Observe(usage.Detail{InputTokens: 39320, OutputTokens: 26, TotalTokens: 39346, CachedTokens: 33280}, true)
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("buffer detail ok = false, want true")
+	}
+	if detail.InputTokens != 39320 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 39320)
+	}
+	if detail.OutputTokens != 26 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 26)
+	}
+	if detail.TotalTokens != 39346 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 39346)
+	}
+	if detail.CachedTokens != 33280 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 33280)
+	}
+}
+
+func TestStreamUsageBufferPreservesOnlyZeroUsage(t *testing.T) {
+	var buffer StreamUsageBuffer
+	buffer.Observe(usage.Detail{}, true)
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("buffer detail ok = false, want true")
+	}
+	if detail != (usage.Detail{}) {
+		t.Fatalf("detail = %+v, want zero detail", detail)
 	}
 }
 
