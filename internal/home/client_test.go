@@ -26,7 +26,7 @@ import (
 )
 
 func TestAuthDispatchRequestIncludesCount(t *testing.T) {
-	req := newAuthDispatchRequest("gpt-5.4", "session-1", http.Header{"Authorization": {"Bearer test"}}, 2)
+	req := newAuthDispatchRequest("gpt-5.4", "session-1", http.Header{"Authorization": {"Bearer test"}}, 2, "")
 
 	raw, err := json.Marshal(&req)
 	if err != nil {
@@ -46,10 +46,28 @@ func TestAuthDispatchRequestIncludesCount(t *testing.T) {
 }
 
 func TestAuthDispatchRequestDefaultsCountToOne(t *testing.T) {
-	req := newAuthDispatchRequest("gpt-5.4", "", nil, 0)
+	req := newAuthDispatchRequest("gpt-5.4", "", nil, 0, "")
 
 	if req.Count != 1 {
 		t.Fatalf("count = %d, want 1", req.Count)
+	}
+	if req.CredentialPolicy != "" {
+		t.Fatalf("credential policy = %q, want empty", req.CredentialPolicy)
+	}
+}
+
+func TestAuthDispatchRequestIncludesCredentialPolicy(t *testing.T) {
+	req := newAuthDispatchRequest("gpt-5.4", "", nil, 1, "codex_alpha_search_v1")
+	raw, errMarshal := json.Marshal(&req)
+	if errMarshal != nil {
+		t.Fatalf("marshal auth dispatch request: %v", errMarshal)
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal auth dispatch request: %v", errUnmarshal)
+	}
+	if got := payload["credential_policy"]; got != "codex_alpha_search_v1" {
+		t.Fatalf("credential_policy = %#v, want codex_alpha_search_v1", got)
 	}
 }
 
@@ -534,9 +552,9 @@ func TestKVSetConditionUnmetReturnsFalse(t *testing.T) {
 	}
 }
 
-func TestKVCompareAndSwapReturnsScriptResult(t *testing.T) {
+func TestKVCompareAndSwapSendsCASCommand(t *testing.T) {
 	client, commands := newRedisCommandTestClient(t, func(args []string) string {
-		if len(args) > 0 && strings.EqualFold(args[0], "EVAL") {
+		if len(args) > 0 && strings.EqualFold(args[0], "CAS") {
 			return ":1\r\n"
 		}
 		return "-ERR unexpected command\r\n"
@@ -549,8 +567,70 @@ func TestKVCompareAndSwapReturnsScriptResult(t *testing.T) {
 	if !swapped {
 		t.Fatal("KVCompareAndSwap() swapped = false, want true")
 	}
-	if lastCommand := commands.Last(); len(lastCommand) < 2 || !strings.EqualFold(lastCommand[0], "EVAL") {
-		t.Fatalf("last command = %#v, want EVAL", lastCommand)
+	want := []string{"CAS", "key", "1", "old", "new", "PX", "1500"}
+	if lastCommand := commands.Last(); !reflect.DeepEqual(lastCommand, want) {
+		t.Fatalf("last command = %#v, want %#v", lastCommand, want)
+	}
+}
+
+func TestKVCompareAndSwapOmitsPXWithoutTTL(t *testing.T) {
+	client, commands := newRedisCommandTestClient(t, func(args []string) string {
+		if len(args) > 0 && strings.EqualFold(args[0], "CAS") {
+			return ":1\r\n"
+		}
+		return "-ERR unexpected command\r\n"
+	})
+
+	if _, errCAS := client.KVCompareAndSwap(context.Background(), "key", nil, false, []byte("new"), 0); errCAS != nil {
+		t.Fatalf("KVCompareAndSwap() error = %v", errCAS)
+	}
+	// An absent expected value is sent as an empty bulk string, and no TTL means
+	// no PX, which tells Home to store the value without an expiry.
+	want := []string{"CAS", "key", "0", "", "new"}
+	if lastCommand := commands.Last(); !reflect.DeepEqual(lastCommand, want) {
+		t.Fatalf("last command = %#v, want %#v", lastCommand, want)
+	}
+}
+
+func TestKVCompareAndSwapReportsMismatch(t *testing.T) {
+	client, _ := newRedisCommandTestClient(t, func(args []string) string {
+		if len(args) > 0 && strings.EqualFold(args[0], "CAS") {
+			return ":0\r\n"
+		}
+		return "-ERR unexpected command\r\n"
+	})
+
+	swapped, errCAS := client.KVCompareAndSwap(context.Background(), "key", []byte("old"), true, []byte("new"), time.Minute)
+	if errCAS != nil {
+		t.Fatalf("KVCompareAndSwap() error = %v", errCAS)
+	}
+	if swapped {
+		t.Fatal("KVCompareAndSwap() swapped = true, want false")
+	}
+}
+
+func TestKVCompareAndSwapLatchesUnsupportedHome(t *testing.T) {
+	client, commands := newRedisCommandTestClient(t, func(args []string) string {
+		if len(args) > 0 && strings.EqualFold(args[0], "CAS") {
+			return "-ERR unknown command 'cas'\r\n"
+		}
+		return "-ERR unexpected command\r\n"
+	})
+
+	_, errFirst := client.KVCompareAndSwap(context.Background(), "key", nil, false, []byte("new"), time.Minute)
+	if !errors.Is(errFirst, ErrCompareAndSwapUnsupported) {
+		t.Fatalf("KVCompareAndSwap() first error = %v, want ErrCompareAndSwapUnsupported", errFirst)
+	}
+	if sent := commands.CountCommandKey("CAS", "key"); sent != 1 {
+		t.Fatalf("CAS sent %d times, want 1", sent)
+	}
+
+	_, errSecond := client.KVCompareAndSwap(context.Background(), "key", nil, false, []byte("new"), time.Minute)
+	if !errors.Is(errSecond, ErrCompareAndSwapUnsupported) {
+		t.Fatalf("KVCompareAndSwap() second error = %v, want ErrCompareAndSwapUnsupported", errSecond)
+	}
+	if sent := commands.CountCommandKey("CAS", "key"); sent != 1 {
+		t.Fatalf("CAS sent %d times after latching, want 1", sent)
 	}
 }
 

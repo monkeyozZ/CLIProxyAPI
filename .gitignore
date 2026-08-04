@@ -10,6 +10,7 @@ config.yaml
 bin/*
 logs/*
 usage/*
+/logs
 conv/*
 temp/*
 refs/*
