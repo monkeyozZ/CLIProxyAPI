@@ -13,10 +13,13 @@ if ! command -v "${GO_BIN}" >/dev/null 2>&1; then
 fi
 
 echo "[kiro-check] validating Kiro executor request/response shaping"
-"${GO_BIN}" test ./internal/runtime/executor -run 'Test(BuildKiroRequestBody|BuildClaudeResponsePayload|BuildClaudeStreamEventsPreserveIncrementalToolUseDeltas|BuildClaudeDataLinesTranslate|RewriteOpenAIResponsesCompactPayload|NormalizeKiroOpenAIResponsesInputPreservesArrayInput)'
+"${GO_BIN}" test ./internal/runtime/executor -run 'Test(Kiro|BuildKiro|BuildClaude|NormalizeClaudeStreamEventIndices|ParseAnthropicAssistantMessage|RewriteOpenAIResponsesCompactPayload|NormalizeKiro)'
 
 echo "[kiro-check] validating Kiro auth/model helpers"
-"${GO_BIN}" test ./internal/runtime/executor/helps -run 'Test(ResolveKiroProfileContextUsesFixedBuilderProfile|BuildKiroRegistryModelsFiltersUnsupportedModels|KiroMapModelSupportsDirectCatalogModels)'
+"${GO_BIN}" test ./internal/runtime/executor/helps -run 'Test(Kiro|ResolveKiro|ApplyKiro|BuildKiro)'
+
+echo "[kiro-check] validating Kiro management and SDK integration"
+"${GO_BIN}" test ./internal/api/handlers/management ./sdk/cliproxy -run 'Test(Kiro|NormalizeOAuthProviderSupportsKiro)'
 
 echo "[kiro-check] validating Kiro shared translator paths"
 "${GO_BIN}" test \

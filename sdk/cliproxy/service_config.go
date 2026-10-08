@@ -5,9 +5,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -25,15 +26,17 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy           string
-	sessionAffinity    bool
-	sessionAffinityTTL time.Duration
+	strategy                 string
+	sessionAffinity          bool
+	sessionAffinityTTL       time.Duration
+	sessionAffinitySubagents bool
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:           "round-robin",
-		sessionAffinityTTL: time.Hour,
+		strategy:                 "round-robin",
+		sessionAffinityTTL:       time.Hour,
+		sessionAffinitySubagents: true,
 	}
 	if cfg == nil {
 		return state
@@ -48,8 +51,14 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
+			if parsed < time.Second {
+				parsed = time.Second
+			}
 			state.sessionAffinityTTL = parsed
 		}
+	}
+	if state.sessionAffinity && cfg.Routing.SessionAffinitySubagents != nil {
+		state.sessionAffinitySubagents = *cfg.Routing.SessionAffinitySubagents
 	}
 	return state
 }
@@ -65,9 +74,11 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.RoundRobinSelector{}
 	}
 	if state.sessionAffinity {
+		subagents := state.sessionAffinitySubagents
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback: selector,
-			TTL:      state.sessionAffinityTTL,
+			Fallback:         selector,
+			TTL:              state.sessionAffinityTTL,
+			SubagentAffinity: &subagents,
 		})
 	}
 	return selector
@@ -82,7 +93,8 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(ctx context.Context, newCfg
 }
 
 // commitConfigUpdate applies only in-memory configuration state. Runtime work that
-// may block on plugins, models, storage, or networking is deliberately deferred.
+// may block on plugins, storage, or networking is deliberately deferred. Catalog
+// source generations change here so an older commit cannot restart stale readers.
 func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	if s == nil {
 		return configCommit{}
@@ -104,10 +116,16 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		return configCommit{}
 	}
 
+	if errValidate := newCfg.Models.Validate(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected invalid model catalog sources")
+		return configCommit{}
+	}
 	s.cfgMu.Lock()
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
+	s.cancelStaleAntigravityProbes("")
 	s.configSequence++
+	registry.UpdateModelCatalogSources(newCfg.Models, newCfg.Home.Enabled)
 	return configCommit{cfg: newCfg, sequence: s.configSequence}
 }
 
@@ -147,6 +165,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if !s.applyPprofConfigContext(ctx, cfg) {
 		return false
 	}
+	s.applyDiscoveryConfigContext(ctx, cfg)
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}

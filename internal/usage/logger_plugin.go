@@ -23,9 +23,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -474,7 +474,7 @@ func eventFromUsageRecord(ctx context.Context, record coreusage.Record) Event {
 	apiKey := strings.TrimSpace(record.APIKey)
 
 	event := Event{
-		RequestID:           strings.TrimSpace(internallogging.GetRequestID(ctx)),
+		RequestID:           nonEmpty(record.RequestID, strings.TrimSpace(internallogging.GetRequestID(ctx))),
 		TimestampMS:         timestamp.UnixMilli(),
 		Timestamp:           timestamp.UTC().Format(time.RFC3339Nano),
 		Provider:            nonEmpty(record.Provider, "unknown"),
@@ -1013,7 +1013,14 @@ func ParseImportPayload(data []byte) (ImportParseResult, error) {
 	}
 	switch trimmed[0] {
 	case '{':
-		return parseJSONObjectImport(trimmed)
+		parsed, err := parseJSONObjectImport(trimmed)
+		if err != nil && bytes.ContainsRune(trimmed, '\n') && !json.Valid(trimmed) {
+			jsonl, errJSONL := parseJSONLImport(trimmed)
+			if errJSONL != nil || len(jsonl.Events) > 0 {
+				return jsonl, errJSONL
+			}
+		}
+		return parsed, err
 	case '[':
 		return parseJSONArrayImport(trimmed)
 	default:

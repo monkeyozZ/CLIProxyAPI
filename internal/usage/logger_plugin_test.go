@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestRequestStatisticsRecordBuildsEndpointSnapshot(t *testing.T) {
@@ -149,6 +150,73 @@ func TestRequestStatisticsMigratesLegacyJSONLToSQLite(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsPreservesExecutionRequestIDs(t *testing.T) {
+	disableUsagePostgresBackup(t)
+
+	stats := NewRequestStatistics()
+	if err := stats.ConfigureStorage(filepath.Join(t.TempDir(), "config.yaml")); err != nil {
+		t.Fatalf("ConfigureStorage: %v", err)
+	}
+	ctx := internallogging.WithRequestID(context.Background(), "parent-request")
+	ctx = internallogging.WithEndpoint(ctx, "POST /v1/messages")
+	record := coreusage.Record{
+		TraceID:     "parent-request",
+		Provider:    "kiro",
+		Model:       "claude-opus-4.8",
+		AuthIndex:   "kiro.json#1",
+		RequestedAt: time.Date(2026, 5, 12, 8, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	}
+	for _, requestID := range []string{"execution-1", "execution-2"} {
+		record.RequestID = requestID
+		stats.Record(ctx, record)
+	}
+	stats.Record(ctx, record)
+	if got := stats.Snapshot().TotalRequests; got != 2 {
+		t.Fatalf("total requests = %d, want two distinct executions sharing one trace", got)
+	}
+
+	exported, err := stats.ExportJSONL()
+	if err != nil {
+		t.Fatalf("ExportJSONL: %v", err)
+	}
+	parsed, err := ParseImportPayload(exported)
+	if err != nil {
+		t.Fatalf("ParseImportPayload JSONL export: %v", err)
+	}
+	if len(parsed.Events) != 2 || parsed.Events[0].RequestID != "execution-1" || parsed.Events[1].RequestID != "execution-2" {
+		t.Fatalf("exported events lost execution request IDs: %+v", parsed.Events)
+	}
+	if result := stats.ImportEvents(parsed); result.Added != 0 || result.Skipped != 2 {
+		t.Fatalf("import into original store = %+v, want two skipped events", result)
+	}
+
+	restored := NewRequestStatistics()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := restored.ConfigureStorage(configPath); err != nil {
+		t.Fatalf("ConfigureStorage restore: %v", err)
+	}
+	if result := restored.ImportEvents(parsed); result.Added != 2 || result.Skipped != 0 {
+		t.Fatalf("import into empty store = %+v, want two added events", result)
+	}
+	reloaded := NewRequestStatistics()
+	if err := reloaded.ConfigureStorage(configPath); err != nil {
+		t.Fatalf("ConfigureStorage reload: %v", err)
+	}
+	snapshot := reloaded.Snapshot()
+	if snapshot.TotalRequests != 2 || snapshot.TotalTokens != 30 || snapshot.APIs["POST /v1/messages"].TotalRequests != 2 {
+		t.Fatalf("restored snapshot = %+v, want both executions and token totals", snapshot)
+	}
+}
+
+func TestRequestStatisticsFallsBackToContextRequestID(t *testing.T) {
+	ctx := internallogging.WithRequestID(context.Background(), "legacy-request")
+	event := eventFromUsageRecord(ctx, coreusage.Record{RequestID: " "})
+	if event.RequestID != "legacy-request" {
+		t.Fatalf("request ID = %q, want context request ID for older SDK records", event.RequestID)
+	}
+}
+
 func TestRequestStatisticsClearHistoryPreservesModelPrices(t *testing.T) {
 	disableUsagePostgresBackup(t)
 
@@ -193,6 +261,17 @@ func TestRequestStatisticsClearHistoryPreservesModelPrices(t *testing.T) {
 	if _, ok := prices["claude-opus-4.7"]; !ok {
 		t.Fatalf("model prices after clear = %+v, want preserved price", prices)
 	}
+	reloaded := NewRequestStatistics()
+	if err := reloaded.ConfigureStorage(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("ConfigureStorage reload: %v", err)
+	}
+	if got := reloaded.Snapshot().TotalRequests; got != 0 {
+		t.Fatalf("reloaded total requests = %d, want cleared history", got)
+	}
+	prices, err = reloaded.LoadModelPrices(context.Background())
+	if err != nil || prices["claude-opus-4.7"].Prompt != 1 {
+		t.Fatalf("reloaded model prices = %+v, error = %v, want preserved price", prices, err)
+	}
 }
 
 func TestRequestStatisticsClearHistoryRange(t *testing.T) {
@@ -225,8 +304,8 @@ func TestRequestStatisticsClearHistoryRange(t *testing.T) {
 		t.Fatalf("events before range clear = %d, want 3", statusBefore.Events)
 	}
 
-	startMS := baseTime.Add(30 * time.Minute).UnixMilli()
-	endMS := baseTime.Add(90 * time.Minute).UnixMilli()
+	startMS := baseTime.Add(time.Hour).UnixMilli()
+	endMS := startMS
 	if err := stats.ClearHistoryRange(context.Background(), &startMS, &endMS); err != nil {
 		t.Fatalf("ClearHistoryRange: %v", err)
 	}
@@ -241,6 +320,13 @@ func TestRequestStatisticsClearHistoryRange(t *testing.T) {
 	}
 	if status.Events != 2 || status.Collector.TotalInserted != 2 {
 		t.Fatalf("status after range clear = %+v, want 2 persisted events", status)
+	}
+	reloaded := NewRequestStatistics()
+	if err := reloaded.ConfigureStorage(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("ConfigureStorage reload: %v", err)
+	}
+	if got := reloaded.Snapshot().TotalRequests; got != 2 {
+		t.Fatalf("reloaded total requests = %d, want history outside the inclusive range", got)
 	}
 }
 
@@ -298,5 +384,35 @@ func TestParseImportPayloadAcceptsLegacyUsageExport(t *testing.T) {
 	}
 	if event.Source != "m:sk-t...long" {
 		t.Fatalf("source = %q, want masked key", event.Source)
+	}
+}
+
+func TestParseImportPayloadJSONLAndInvalidJSON(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    string
+		wantEvents int
+		wantFailed int
+		wantError  bool
+	}{
+		{name: "multiple JSONL records", payload: "{\"model\":\"one\"}\n{\"model\":\"two\"}\n", wantEvents: 2},
+		{name: "JSONL with invalid line", payload: "{\"model\":\"one\"}\ninvalid\n{\"model\":\"two\"}\n", wantEvents: 2, wantFailed: 1},
+		{name: "pretty JSON object", payload: "{\n  \"model\": \"one\"\n}", wantEvents: 1},
+		{name: "empty payload", payload: "\n", wantError: true},
+		{name: "invalid JSON object", payload: "{broken}", wantError: true},
+		{name: "invalid multiline JSON", payload: "{\n  broken\n}", wantError: true},
+		{name: "invalid legacy export", payload: "{\n\"usage\": [\n{}\n]\n}", wantError: true},
+		{name: "same-line JSON values", payload: "{\"model\":\"one\"} {\"model\":\"two\"}", wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := ParseImportPayload([]byte(tt.payload))
+			if (err != nil) != tt.wantError {
+				t.Fatalf("ParseImportPayload error = %v, wantError %v", err, tt.wantError)
+			}
+			if len(parsed.Events) != tt.wantEvents || parsed.Failed != tt.wantFailed {
+				t.Fatalf("parsed = %+v, want %d events and %d failed lines", parsed, tt.wantEvents, tt.wantFailed)
+			}
+		})
 	}
 }

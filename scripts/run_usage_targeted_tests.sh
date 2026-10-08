@@ -13,10 +13,13 @@ if ! command -v "${GO_BIN}" >/dev/null 2>&1; then
 fi
 
 echo "[usage-check] validating embedded CPA-Manager SQLite usage storage"
-"${GO_BIN}" test ./internal/usage ./internal/api/handlers/management -run 'Test(RequestStatisticsRecordBuildsEndpointSnapshot|RequestStatisticsPersistsEventsInSQLite|RequestStatisticsMigratesLegacyJSONLToSQLite|ParseImportPayloadAcceptsLegacyUsageExport|GetUsageQueue)'
+"${GO_BIN}" test ./internal/usage
+
+echo "[usage-check] validating usage imports, range clearing, and queue handling"
+"${GO_BIN}" test ./internal/api/handlers/management -run 'Test(GetUsageQueue|UsageClearTimeRange|ImportUsageStatistics)'
 
 echo "[usage-check] validating management usage routes and availability gates"
-"${GO_BIN}" test ./internal/api -run 'Test(Healthz|ManagementUsageRequiresManagementAuthAndQueuePopsArray|HomeEnabledHidesManagementEndpointsAndControlPanel)'
+"${GO_BIN}" test ./internal/api -run 'Test(Healthz|ManagementUsage|ManagementV8|HomeEnabledHidesManagementEndpointsAndControlPanel)'
 
 echo "[usage-check] validating usage queue payload compatibility"
-"${GO_BIN}" test ./internal/redisqueue
+"${GO_BIN}" test ./internal/redisqueue ./sdk/cliproxy/usage

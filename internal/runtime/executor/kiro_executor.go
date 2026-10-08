@@ -13,13 +13,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -72,6 +72,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -79,20 +80,23 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 	originalPayloadSource = normalizeKiroSourcePayload(from, originalPayloadSource)
 	requestPayload := normalizeKiroSourcePayload(from, req.Payload)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, requestPayload, false)
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	originalTranslated, body, err := helps.TranslateRequestPairReturningError(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayloadSource, requestPayload, false, helps.APIKeyModelIsCompat(req))
 	if err != nil {
 		return resp, err
 	}
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return resp, err
+	}
 	kiroBody, err := buildKiroRequestBody(body, auth, baseModel)
 	if err != nil {
 		return resp, err
 	}
+	// Defaults inspect the native shape. An interceptor may have repaired an
+	// invalid original request, so only the working body must build successfully.
+	originalKiroBody, _ := buildKiroRequestBody(originalTranslated, auth, baseModel)
+	finalize := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalKiroBody, req, opts)
+	kiroBody = finalize(kiroBody)
 
 	events, headers, err := e.executeKiroEvents(ctx, auth, kiroBody, baseModel)
 	if err != nil {
@@ -100,7 +104,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 	reporter.EnsurePublished(ctx)
 
-	if from == to {
+	if responseFormat == to {
 		return cliproxyexecutor.Response{
 			Payload: buildClaudeResponsePayload(baseModel, events),
 			Headers: headers,
@@ -111,8 +115,8 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, body, joinClaudeDataLines(dataLines), nil)
-	if opts.Alt == "responses/compact" && from == sdktranslator.FromString("openai-response") {
+	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, joinClaudeDataLines(dataLines), nil)
+	if opts.Alt == "responses/compact" && responseFormat == sdktranslator.FromString("openai-response") {
 		out = rewriteOpenAIResponsesCompactPayload(out)
 	}
 	return cliproxyexecutor.Response{Payload: out, Headers: headers}, nil
@@ -127,6 +131,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -134,20 +139,22 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	originalPayloadSource = normalizeKiroSourcePayload(from, originalPayloadSource)
 	requestPayload := normalizeKiroSourcePayload(from, req.Payload)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, requestPayload, true)
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	originalTranslated, body, err := helps.TranslateRequestPairReturningError(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayloadSource, requestPayload, true, helps.APIKeyModelIsCompat(req))
 	if err != nil {
 		return nil, err
 	}
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
-
+	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return nil, err
+	}
 	kiroBody, err := buildKiroRequestBody(body, auth, baseModel)
 	if err != nil {
 		return nil, err
 	}
+	// Apply rules once after all Kiro history, tool, and thinking normalization.
+	originalKiroBody, _ := buildKiroRequestBody(originalTranslated, auth, baseModel)
+	finalize := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalKiroBody, req, opts)
+	kiroBody = finalize(kiroBody)
 	events, headers, err := e.executeKiroEvents(ctx, auth, kiroBody, baseModel)
 	if err != nil {
 		return nil, err
@@ -164,7 +171,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			log.Errorf("kiro executor: stream emission failed: %v", err)
 			out <- cliproxyexecutor.StreamChunk{Err: err}
 		}
-		if from == to {
+		if responseFormat == to {
 			chunks, errBuild := buildClaudeSSEChunks(baseModel, events)
 			if errBuild != nil {
 				sendStreamErr(statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("kiro build claude sse chunks failed: %v", errBuild)})
@@ -188,7 +195,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		var param any
 		sentAny := false
 		for _, line := range dataLines {
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, line, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, line, &param)
 			for i := range chunks {
 				if len(chunks[i]) == 0 {
 					continue

@@ -94,15 +94,19 @@ jobs:
           :(glob)internal/runtime/executor/kiro*.go
           :(glob)internal/runtime/executor/helps/kiro*.go
           internal/api/server.go
-          internal/api/handlers/management/auth_files.go
+          :(glob)internal/api/server_management*.go
+          internal/api/server_routes.go
+          :(glob)internal/api/handlers/management/auth_files*.go
           internal/api/handlers/management/api_tools.go
           internal/api/handlers/management/oauth_sessions.go
-          internal/api/handlers/management/oauth_callback.go
+          internal/api/handlers/management/auth_files_oauth_callback.go
           internal/config/config.go
           internal/managementasset/updater.go
           internal/registry/model_definitions.go
           sdk/api/management.go
           sdk/cliproxy/service.go
+          sdk/cliproxy/service_executors.go
+          sdk/cliproxy/service_models.go
           internal/tui/oauth_tab.go
           config.example.yaml
           EOF
@@ -127,6 +131,17 @@ jobs:
           :(glob)internal/api/handlers/management/kiro*.go
           :(glob)internal/runtime/executor/kiro*.go
           :(glob)internal/runtime/executor/helps/kiro*.go
+          :(glob)internal/api/handlers/management/auth_files*.go
+          internal/api/handlers/management/api_tools.go
+          internal/api/handlers/management/oauth_sessions.go
+          :(glob)internal/api/server_management*.go
+          internal/api/server_routes.go
+          internal/registry/model_definitions.go
+          sdk/cliproxy/service_executors.go
+          sdk/cliproxy/service_models.go
+          :(glob)sdk/cliproxy/executor/**
+          internal/runtime/executor/helps/codex_multi_agent_v2.go
+          :(glob)internal/runtime/executor/helps/payload*.go
           sdk/translator/registry.go
           internal/interfaces/types.go
           internal/constant/constant.go
@@ -153,7 +168,11 @@ jobs:
             git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" -- "${pattern}" >> cpa_guarded_files.txt || true
           done <<'EOF'
           :(glob)internal/usage/**
+          cmd/server/main.go
           internal/api/server.go
+          :(glob)internal/api/server_management*.go
+          internal/api/server_routes.go
+          internal/api/server_reload.go
           internal/api/server_test.go
           internal/api/handlers/management/usage.go
           internal/api/handlers/management/usage_test.go
@@ -180,7 +199,11 @@ jobs:
             git diff --name-only "origin/${DEFAULT_BRANCH}...HEAD" -- "${pattern}" >> cpa_validation_files.txt || true
           done <<'EOF'
           :(glob)internal/usage/**
+          cmd/server/main.go
           internal/api/server.go
+          :(glob)internal/api/server_management*.go
+          internal/api/server_routes.go
+          internal/api/server_reload.go
           internal/api/server_test.go
           internal/api/handlers/management/usage.go
           internal/api/handlers/management/usage_test.go

@@ -16,10 +16,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -286,6 +287,7 @@ func RefreshKiroAuth(ctx context.Context, cfg *config.Config, auth *cliproxyauth
 	if auth == nil {
 		return nil, KiroHTTPStatusError{code: http.StatusUnauthorized, msg: "missing kiro auth"}
 	}
+	ctx = cliproxyexecutor.WithoutRequestProxyURL(ctx)
 	creds := KiroCredentialsFromAuth(auth)
 	refreshToken := strings.TrimSpace(creds.RefreshToken)
 	if refreshToken == "" {
@@ -927,6 +929,9 @@ func NewKiroHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		client.Timeout = timeout
 	}
 	proxyURL := effectiveKiroProxyURL(cfg, auth, creds)
+	if requestProxyURL := cliproxyexecutor.RequestProxyURL(ctx); requestProxyURL != "" {
+		proxyURL = requestProxyURL
+	}
 	if proxyURL != "" {
 		if transport, _, err := proxyutil.BuildHTTPTransport(proxyURL); err == nil && transport != nil {
 			client.Transport = transport

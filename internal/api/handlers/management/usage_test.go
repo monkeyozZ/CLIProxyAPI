@@ -4,10 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 )
 
 func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
@@ -64,6 +65,42 @@ func TestGetUsageQueueInvalidCountDoesNotPop(t *testing.T) {
 			t.Fatalf("remaining queue = %q, want original item", remaining)
 		}
 	})
+}
+
+func TestUsageClearTimeRangeRejectsInvalidBounds(t *testing.T) {
+	for _, query := range []string{
+		"startMs=-1",
+		"endMs=invalid",
+		"startMs=9223372036854775808",
+		"startMs=2&endMs=1",
+		"from=2&to=1",
+	} {
+		t.Run(query, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(rec)
+			ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v8/management/observability/usage?"+query, nil)
+			h := &Handler{}
+			h.DeleteUsageStatistics(ginCtx)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestImportUsageStatisticsRejectsInvalidJSON(t *testing.T) {
+	for _, payload := range []string{"", "{broken}", "{\n  broken\n}"} {
+		t.Run(payload, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(rec)
+			ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v8/management/observability/usage/import", strings.NewReader(payload))
+			h := &Handler{}
+			h.ImportUsageStatistics(ginCtx)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
 }
 
 func withManagementUsageQueue(t *testing.T, fn func()) {
